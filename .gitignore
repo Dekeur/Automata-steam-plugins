@@ -1,7 +1,14 @@
 # Environnement Python
 .venv/
+.venv-build/
 __pycache__/
 *.pyc
+
+# Construction du .exe (construire_exe.bat)
+build/
+dist/
+*.spec
+*.zip
 
 # Données locales de chaque utilisateur (jeux possédés, jeux cochés, compteurs, erreurs)
 config.json
