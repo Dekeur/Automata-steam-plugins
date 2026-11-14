@@ -1,0 +1,14 @@
+# Environnement Python
+.venv/
+__pycache__/
+*.pyc
+
+# Données locales de chaque utilisateur (jeux possédés, jeux cochés, compteurs, erreurs)
+config.json
+journal.txt
+.afficher
+_verif_in.json
+_verif_out.json
+
+# DLL de Valve : copiée automatiquement depuis un jeu installé, ne pas la redistribuer
+steam_api64.dll
