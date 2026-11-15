@@ -1,8 +1,9 @@
 """
-Farm d'heures Steam
--------------------
+Farm d'heures Steam / Steam Hours Farm
+--------------------------------------
 Fait tourner tes jeux Steam « à vide » : Steam croit que le jeu est lancé et
 compte le temps de jeu (et les drops de cartes), sans rien exécuter du jeu.
+Interface en français ou en anglais (choix au premier lancement, puis dans Options).
 
 Chaque jeu farmé est un petit processus qui s'annonce à Steam via
 steam_api64.dll (la DLL officielle de Valve, copiée depuis un de tes jeux).
@@ -35,7 +36,7 @@ from pathlib import Path
 # Pillow, pystray et tkinter ne sont importés que pour la fenêtre (voir interface()) :
 # les processus de farm restent ainsi très légers.
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 PROJET = "https://github.com/Dekeur/steam-hours-farm"
 GELE = getattr(sys, "frozen", False)          # True dans le .exe construit avec PyInstaller
 ICI = Path(sys.executable).resolve().parent if GELE else Path(__file__).resolve().parent
@@ -52,15 +53,55 @@ SANS_FENETRE = 0x08000000         # CREATE_NO_WINDOW
 REMB_JOURS, REMB_SECONDES = 14, 2 * 3600   # règle de remboursement de Steam
 OBJECTIF_REMB = 110 / 60          # « farmer jusqu'à 1 h 50 » pour garder le remboursement
 ESSAIS_MAX, DELAI_ESSAI = 3, 30   # nouvel essai quand Steam refuse un jeu (souvent : Steam pas prêt)
-PAUSE_STEAM = 20                  # secondes d'attente après le retour de Steam avant de relancer
+PAUSE_STEAM = 20                  # secondes d'attente après le retour de Steam (ou la fin d'un jeu) avant de relancer
+VERIF_JEU = 5                     # secondes entre deux recherches d'un vrai jeu lancé
+GRACE_ARRET = 60                  # Steam marque encore « lancé » un jeu farmé quelques secondes après son arrêt
+STATUTS = {0: "offline", 1: "online", 3: "away", 4: "snooze", 7: "invisible"}   # EPersonaState -> steam://friends/status/…
+INVISIBLE = 7
 
 FOND, PANNEAU, BORD = "#121419", "#1b1f27", "#2a303b"
 TEXTE, DOUX, GRIS = "#eef0f4", "#c3c8d2", "#8b93a3"
 ACCENT, ACCENT_CLAIR, ENCRE = "#66c0f4", "#93d5fb", "#0b1220"
 VERT, ROUGE, ORANGE, SELECTION = "#7bd88f", "#f08080", "#f0b45a", "#263850"
 BARRE = "#3b8fd0"                 # barres des statistiques (validée pour le fond sombre)
-FILTRES = ("Tous les jeux", "Cochés", "En cours", "Avec objectif", "Remboursables", "Jamais lancés", "Installés")
-JOURS = ("lun.", "mar.", "mer.", "jeu.", "ven.", "sam.", "dim.")
+FILTRES = (("tous", "Tous les jeux"), ("coches", "Cochés"), ("encours", "En cours"), ("objectif", "Avec objectif"),
+           ("remb", "Remboursables"), ("jamais", "Jamais lancés"), ("installes", "Installés"))
+JOURS = {"fr": ("lun.", "mar.", "mer.", "jeu.", "ven.", "sam.", "dim."),
+         "en": ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")}
+MOIS_EN = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
+LANGUES = (("fr", "Français"), ("en", "English"))
+LANGUE = "fr"                     # "fr" ou "en" : lue dans config.json au démarrage
+
+
+# ───────────────────────── Langue ─────────────────────────
+
+def T(s: str, **kw) -> str:
+    """Traduit un texte écrit en français (voir le dictionnaire EN en bas du fichier)."""
+    if LANGUE == "en":
+        s = EN.get(s, s)
+    return s.format(**kw) if kw else s
+
+
+def pluriel(n: int, un: str, plusieurs: str, **kw) -> str:
+    """En français 0 et 1 sont au singulier, en anglais seulement 1."""
+    singulier = n <= 1 if LANGUE == "fr" else n == 1
+    return T(un if singulier else plusieurs, n=n, **kw)
+
+
+def langue_systeme() -> str:
+    try:
+        return "fr" if ctypes.windll.kernel32.GetUserDefaultUILanguage() & 0x3FF == 0x0C else "en"
+    except Exception:
+        return "en"
+
+
+def charger_langue() -> None:
+    global LANGUE
+    try:
+        choix = json.loads(CONFIG.read_text(encoding="utf-8")).get("langue")
+    except (OSError, ValueError, AttributeError):
+        choix = None
+    LANGUE = choix if choix in ("fr", "en") else langue_systeme()
 
 
 def journal(msg: str) -> None:
@@ -135,6 +176,66 @@ def steam_pret() -> bool:
     return bool(uid) and (not pid or _processus_actif(pid))
 
 
+def jeu_lance(exclure: set[int]) -> tuple[int, str] | None:
+    """Un jeu que Steam marque comme lancé (Apps\\<appid>\\Running) et qui n'est pas dans `exclure`."""
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Valve\Steam\Apps") as k:
+            i = 0
+            while True:
+                try:
+                    nom = winreg.EnumKey(k, i)
+                except OSError:
+                    return None
+                i += 1
+                if not nom.isdigit() or int(nom) in exclure:
+                    continue
+                try:
+                    with winreg.OpenKey(k, nom) as s:
+                        if winreg.QueryValueEx(s, "Running")[0] != 1:
+                            continue
+                        try:
+                            titre = str(winreg.QueryValueEx(s, "Name")[0])
+                        except OSError:
+                            titre = f"App {nom}"
+                        return int(nom), titre
+                except OSError:
+                    continue
+    except OSError:
+        return None
+
+
+class _DerniereSaisie(ctypes.Structure):
+    _fields_ = [("cbSize", wintypes.UINT), ("dwTime", wintypes.DWORD)]
+
+
+def inactivite() -> float:
+    """Secondes depuis la dernière action au clavier ou à la souris."""
+    info = _DerniereSaisie(ctypes.sizeof(_DerniereSaisie), 0)
+    if not ctypes.windll.user32.GetLastInputInfo(ctypes.byref(info)):
+        return 0.0
+    return ((ctypes.windll.kernel32.GetTickCount() - info.dwTime) & 0xFFFFFFFF) / 1000
+
+
+def statut_steam(steam: Path) -> int | None:
+    """Statut choisi dans la liste d'amis de Steam (1 en ligne, 3 absent, 7 invisible…), d'après localconfig.vdf."""
+    uid = utilisateur_actif()
+    try:
+        texte = (steam / "userdata" / str(uid) / "config" / "localconfig.vdf").read_text(encoding="utf-8",
+                                                                                         errors="replace")
+    except OSError:
+        return None
+    m = re.search(r'"FriendStoreLocalPrefs_\d+"\s+"[^\n]*?ePersonaState\\?"\s*:\s*(\d+)', texte)
+    return int(m.group(1)) if m else None
+
+
+def changer_statut(code: int) -> None:
+    """Change le statut Steam (liste d'amis) par le protocole steam://."""
+    try:
+        os.startfile("steam://friends/status/" + STATUTS.get(code, "online"))
+    except OSError as e:
+        journal(T("changement de statut Steam impossible : {e}", e=e))
+
+
 _JETON = re.compile(r'"((?:[^"\\]|\\.)*)"|([{}])')
 
 
@@ -192,7 +293,7 @@ def infos_applis(steam: Path) -> dict[int, tuple[str, str, bool]]:
     data = (steam / "appcache" / "appinfo.vdf").read_bytes()
     magique = struct.unpack_from("<I", data)[0]
     if magique not in (0x07564427, 0x07564428, 0x07564429):
-        raise ValueError(f"appinfo.vdf : format inconnu {magique:#x}")
+        raise ValueError(T("appinfo.vdf : format inconnu {m}", m=f"{magique:#x}"))
     chaines: list[str] | None = None
     pos = 8
     if magique == 0x07564429:          # v29 : les clés sont des index dans une table de chaînes
@@ -306,7 +407,7 @@ def preparer_dll(steam: Path) -> bool:
             k32.FreeLibrary(h)
             if ok:
                 shutil.copy2(f, DLL)
-                journal(f"DLL copiée depuis {f}")
+                journal(T("DLL copiée depuis {f}", f=f))
                 return True
     return False
 
@@ -322,7 +423,7 @@ def _steam_api():
         ok, msg = r == 0, err.value.decode("utf-8", "replace") or f"code {r}"
     else:
         api.SteamAPI_Init.restype = ctypes.c_bool
-        ok, msg = bool(api.SteamAPI_Init()), "SteamAPI_Init a échoué"
+        ok, msg = bool(api.SteamAPI_Init()), T("SteamAPI_Init a échoué")
     api.SteamAPI_IsSteamRunning.restype = ctypes.c_bool
     return api, ok, msg
 
@@ -332,7 +433,7 @@ def mode_farm(appid: int, parent: int) -> int:
     os.environ["SteamAppId"] = os.environ["SteamGameId"] = str(appid)
     api, ok, msg = _steam_api()
     if not ok:
-        journal(f"[{appid}] Steam a refusé : {msg}")
+        journal(T("[{a}] Steam a refusé : {m}", a=appid, m=msg))
         return 4
     k32 = ctypes.WinDLL("kernel32")
     k32.OpenProcess.restype = wintypes.HANDLE
@@ -349,7 +450,7 @@ def mode_farm(appid: int, parent: int) -> int:
             time.sleep(1)
         api.SteamAPI_RunCallbacks()
         if not api.SteamAPI_IsSteamRunning():
-            journal(f"[{appid}] Steam s'est fermé")
+            journal(T("[{a}] Steam s'est fermé", a=appid))
             code = 5
             break
     api.SteamAPI_Shutdown()
@@ -399,13 +500,13 @@ def verifier_possession(ids: list[int]) -> dict | None:
                        stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         res = json.loads(sortie.read_text(encoding="utf-8"))
     except (OSError, subprocess.TimeoutExpired, ValueError) as e:
-        journal(f"vérification des jeux possédés impossible : {e}")
+        journal(T("vérification des jeux possédés impossible : {e}", e=e))
         return None
     finally:
         entree.unlink(missing_ok=True)
         sortie.unlink(missing_ok=True)
     if "erreur" in res:
-        journal(f"vérification des jeux possédés : Steam a refusé ({res['erreur']})")
+        journal(T("vérification des jeux possédés : Steam a refusé ({e})", e=res["erreur"]))
         return None
     return {"possedes": set(res["possedes"]), "achats": {int(a): t for a, t in res.get("achats", {}).items() if t},
             "famille": set(res.get("famille", []))}
@@ -418,9 +519,13 @@ def hms(s: float) -> str:
     return f"{s // 3600}:{s // 60 % 60:02d}:{s % 60:02d}"
 
 
-def heures(minutes: float, vide: str = "—") -> str:
+def heures(minutes: float, vide: str | None = "—") -> str:
+    """Durée en heures et minutes : « 312 h 46 » (fr) ou « 312h 46m » (en). vide=None affiche aussi le zéro."""
     minutes = int(minutes)
-    return f"{minutes // 60} h {minutes % 60:02d}" if minutes else vide
+    if not minutes and vide is not None:
+        return vide
+    h, m = divmod(minutes, 60)
+    return f"{h}h {m:02d}m" if LANGUE == "en" else f"{h} h {m:02d}"
 
 
 def nombre(texte: str) -> float:
@@ -435,9 +540,42 @@ def court(v: float) -> str:
     return f"{v:.2f}".rstrip("0").rstrip(".")
 
 
+def nombre_txt(v: float) -> str:
+    """Nombre à afficher : virgule en français, point en anglais."""
+    return court(v) if LANGUE == "en" else court(v).replace(".", ",")
+
+
 def objectif_txt(h: float) -> str:
     """Objectif en heures, lisible : 500 -> '500 h', 1.8333 -> '1 h 50'."""
-    return f"{round(h)} h" if abs(h - round(h)) < 1e-6 else heures(round(h * 60), "0 h")
+    if abs(h - round(h)) < 1e-6:
+        return f"{round(h)}h" if LANGUE == "en" else f"{round(h)} h"
+    return heures(round(h * 60), None)
+
+
+def pct(p: int) -> str:
+    return f"{p}%" if LANGUE == "en" else f"{p} %"
+
+
+def jour_court(d) -> str:
+    return JOURS[LANGUE][d.weekday()]
+
+
+def date_courte(d) -> str:
+    return f"{MOIS_EN[d.month - 1]} {d.day}" if LANGUE == "en" else d.strftime("%d/%m")
+
+
+def moment(ts: float) -> str:
+    """Jour et heure d'un instant à venir : « sam. 22/11 à 14 h 05 » / « Sat Nov 22, 14:05 »."""
+    d = dt.datetime.fromtimestamp(ts)
+    h = f"{d:%H:%M}" if LANGUE == "en" else f"{d:%H} h {d:%M}"
+    ecart = (d.date() - dt.date.today()).days
+    if ecart == 0:
+        return T("aujourd'hui à {h}", h=h)
+    if ecart == 1:
+        return T("demain à {h}", h=h)
+    if LANGUE == "en":
+        return f"{jour_court(d)} {date_courte(d)}, {h}"
+    return f"{jour_court(d)} {date_courte(d)} à {h}"
 
 
 def garder_eveille(oui: bool) -> None:
@@ -584,6 +722,7 @@ def interface(auto: bool, apres=None) -> None:
 
     class Appli:
         def __init__(self, r: tk.Tk):
+            global LANGUE
             self.r = r
             try:
                 self.cfg = json.loads(CONFIG.read_text(encoding="utf-8"))
@@ -611,11 +750,15 @@ def interface(auto: bool, apres=None) -> None:
             self.groupes: dict[str, list[int]] = c.get("groupes", {})
             self.base_farme: dict[int, float] = {}
             self.procs: dict[int, tuple[subprocess.Popen, float]] = {}
-            self.echecs: dict[int, str] = {}
+            self.echecs: dict[int, str | int] = {}          # "refus" ou code de sortie
             self.essais: dict[int, tuple[int, float]] = {}
+            self.arretes: dict[int, float] = {}             # jeux arrêtés récemment -> heure de l'arrêt
             self.actif, self.debut, self.total_depart = False, 0.0, 0.0
-            self.pause_steam: float | None = None
-            self.steam_revenu: float | None = None
+            self.pause: str | None = None                   # "steam", "jeu" (un vrai jeu est lancé) ou "pc"
+            self.reprise_depuis: float | None = None
+            self.jeu_reel: tuple[int, str] | None = None
+            self.derniere_verif_jeu = 0.0
+            self.statut_avant: int | None = c.get("statut_avant")
             self.derniere_rotation = 0.0
             self.dernier_tic = time.time()
             self.tri = ("nom", False)
@@ -628,12 +771,24 @@ def interface(auto: bool, apres=None) -> None:
             self._rendu_prevu = None
             self._masque = None
             self._maj_objectif = False
+            self._note = ""
             self._derniere_sauvegarde = time.time()
             self.duree = tk.StringVar(value=str(c.get("heures", "0")))
             self.rotation = tk.StringVar(value=str(c.get("rotation", "2")))
             self.eveille = tk.BooleanVar(value=c.get("eveille", True))
             self.au_demarrage = tk.BooleanVar(value=demarrage_windows())
+            self.invisible = tk.BooleanVar(value=c.get("invisible", False))
+            self.pause_jeu = tk.BooleanVar(value=c.get("pause_jeu", True))
+            self.si_inactif = tk.BooleanVar(value=c.get("si_inactif", False))
+            self.inactif_min = tk.StringVar(value=str(c.get("inactif_min", "10")))
             self._style()
+            if c.get("langue") in ("fr", "en"):
+                LANGUE = c["langue"]
+            elif auto:                       # démarrage caché : pas de question, langue de Windows
+                LANGUE = langue_systeme()
+            else:
+                self._choisir_langue()
+            r.title(T("Farm d'heures Steam"))
             self._construire()
             self._creer_tray()
             self._recharger()
@@ -646,9 +801,8 @@ def interface(auto: bool, apres=None) -> None:
         # ── apparence ──
         def _style(self):
             r, k = self.r, self.k
-            r.title("Farm d'heures Steam")
-            r.geometry(f"{int(1000 * k)}x{int(740 * k)}")
-            r.minsize(int(840 * k), int(580 * k))
+            self._taille(r, 1000, 740)
+            r.minsize(*self._taille_min())
             r.configure(bg=FOND)
             self._logo_tk = ImageTk.PhotoImage(dessiner_logo(64))
             r.iconphoto(True, self._logo_tk)
@@ -690,6 +844,8 @@ def interface(auto: bool, apres=None) -> None:
             s.map("Arret.TButton", background=[("active", "#f5a3a3")])
             s.configure("Verre.TButton", background="#262c36", foreground=TEXTE, padding=(14, 7))
             s.map("Verre.TButton", background=[("active", "#323a47")])
+            s.configure("BanPetit.TButton", background="#323a47", foreground=TEXTE, padding=(8, 2))
+            s.map("BanPetit.TButton", background=[("active", "#3d4655")])
             s.configure("TCheckbutton", background=FOND, foreground=DOUX, indicatorbackground=PANNEAU,
                         indicatorforeground=ENCRE, upperbordercolor=GRIS, lowerbordercolor=GRIS)
             s.map("TCheckbutton", background=[("active", FOND)], foreground=[("active", TEXTE)],
@@ -716,18 +872,67 @@ def interface(auto: bool, apres=None) -> None:
             except Exception:
                 pass
 
+        def _taille(self, fenetre, l: int, h: int):
+            """Taille voulue, réduite si l'écran est trop petit (portable en 1366x768, par exemple)."""
+            l = min(int(l * self.k), fenetre.winfo_screenwidth() - int(40 * self.k))
+            h = min(int(h * self.k), fenetre.winfo_screenheight() - int(110 * self.k))
+            fenetre.geometry(f"{l}x{h}")
+
+        def _taille_min(self) -> tuple[int, int]:
+            r, k = self.r, self.k
+            return (min(int(840 * k), r.winfo_screenwidth() - int(40 * k)),
+                    min(int(580 * k), r.winfo_screenheight() - int(110 * k)))
+
+        def _choisir_langue(self):
+            """Premier lancement : choix de la langue, avant de construire la fenêtre."""
+            global LANGUE
+            r, k = self.r, self.k
+            r.minsize(1, 1)
+            r.resizable(False, False)
+            r.geometry(f"{int(440 * k)}x{int(300 * k)}")
+            r.title("Farm d'heures Steam  ·  Steam Hours Farm")
+            f = ttk.Frame(r, padding=int(26 * k))
+            f.pack(fill="both", expand=True)
+            self._logo_choix = ImageTk.PhotoImage(dessiner_logo(int(56 * k)))
+            ttk.Label(f, image=self._logo_choix).pack(pady=(0, int(12 * k)))
+            ttk.Label(f, text="Choisis ta langue", style="Titre.TLabel").pack()
+            ttk.Label(f, text="Choose your language", style="Gris.TLabel").pack(pady=(2, int(18 * k)))
+            choix = tk.StringVar()
+            defaut = langue_systeme()
+            bas = ttk.Frame(f)
+            bas.pack()
+            for code, nom in LANGUES:
+                b = ttk.Button(bas, text=nom, width=12, style="Accent.TButton" if code == defaut else "TButton",
+                               command=lambda c=code: choix.set(c))
+                b.pack(side="left", padx=int(6 * k))
+                if code == defaut:
+                    b.focus_set()
+            # Entrée valide le bouton qui a le focus (Tab pour passer de l'un à l'autre)
+            r.bind("<Return>", lambda e: e.widget.invoke() if isinstance(e.widget, ttk.Button) else choix.set(defaut))
+            r.protocol("WM_DELETE_WINDOW", lambda: choix.set(defaut))
+            self._choix_langue = choix                     # pour les tests
+            r.wait_variable(choix)
+            r.unbind("<Return>")
+            LANGUE = choix.get() if choix.get() in ("fr", "en") else defaut
+            self.cfg["langue"] = LANGUE
+            f.destroy()
+            r.resizable(True, True)
+            r.minsize(*self._taille_min())
+            self._taille(r, 1000, 740)
+            self._sauver()
+
         def _construire(self):
             r, k = self.r, self.k
             m18 = int(18 * k)
             # barre du haut
             haut = ttk.Frame(r, padding=(m18, int(10 * k), m18, int(8 * k)))
             haut.pack(fill="x")
-            ttk.Label(haut, text="Farm d'heures Steam", style="Titre.TLabel").pack(side="left")
+            ttk.Label(haut, text=T("Farm d'heures Steam"), style="Titre.TLabel").pack(side="left")
             self.sous_titre = ttk.Label(haut, style="Gris.TLabel")
             self.sous_titre.pack(side="left", padx=(14, 0), pady=(3, 0))
-            ttk.Button(haut, text="↻  Recharger", command=self._recharger).pack(side="right")
-            ttk.Button(haut, text="Options", command=self._ouvrir_options).pack(side="right", padx=(0, 8))
-            ttk.Button(haut, text="Statistiques", command=self._ouvrir_stats).pack(side="right", padx=(0, 8))
+            ttk.Button(haut, text=T("↻  Recharger"), command=self._recharger).pack(side="right")
+            ttk.Button(haut, text=T("Options"), command=self._ouvrir_options).pack(side="right", padx=(0, 8))
+            ttk.Button(haut, text=T("Statistiques"), command=self._ouvrir_stats).pack(side="right", padx=(0, 8))
 
             # bannière du jeu sélectionné
             self.ban = tk.Canvas(r, height=int(250 * k), bg=FOND, highlightthickness=0, bd=0)
@@ -742,18 +947,20 @@ def interface(auto: bool, apres=None) -> None:
             self.b_pct = self.ban.create_text(0, 0, anchor="w", fill=DOUX, font=("Segoe UI", 9))
             # objectif d'heures du jeu sélectionné
             obj = ttk.Frame(self.ban, style="Ban.TFrame", padding=(10, 4))
-            ttk.Label(obj, text="Objectif", style="Ban.TLabel").pack(side="left", padx=(0, 6))
+            ttk.Label(obj, text=T("Objectif"), style="Ban.TLabel").pack(side="left", padx=(0, 6))
             self.obj_var = tk.StringVar(value="0")
             self.obj_spin = ttk.Spinbox(obj, from_=0, to=100000, increment=10, width=6, style="Ban.TSpinbox",
                                         textvariable=self.obj_var, command=self._regler_objectif)
             self.obj_spin.pack(side="left")
             self.obj_spin.bind("<Return>", lambda e: (self._regler_objectif(), self.arbre.focus_set()))
             self.obj_spin.bind("<FocusOut>", lambda e: self._regler_objectif())
-            ttk.Label(obj, text="h de jeu au total", style="Ban.TLabel").pack(side="left", padx=(6, 0))
+            ttk.Label(obj, text=T("h de jeu au total"), style="Ban.TLabel").pack(side="left", padx=(6, 8))
+            ttk.Button(obj, text=T("＋ X h…"), style="BanPetit.TButton",
+                       command=lambda: self._encore_dialogue([self.sel])).pack(side="left")
             self.b_w_obj = self.ban.create_window(0, 0, anchor="sw", window=obj)
-            self.b_farm = ttk.Button(self.ban, style="Accent.TButton", width=17, text="＋  Ajouter au farm",
+            self.b_farm = ttk.Button(self.ban, style="Accent.TButton", width=17, text=T("＋  Ajouter au farm"),
                                      command=self._basculer_selection)
-            self.b_steam = ttk.Button(self.ban, text="Ouvrir dans Steam", style="Verre.TButton",
+            self.b_steam = ttk.Button(self.ban, text=T("Ouvrir dans Steam"), style="Verre.TButton",
                                       command=lambda: self._ouvrir("steam://nav/games/details/{}"))
             self.b_w_farm = self.ban.create_window(0, 0, anchor="se", window=self.b_farm)
             self.b_w_steam = self.ban.create_window(0, 0, anchor="se", window=self.b_steam)
@@ -763,23 +970,24 @@ def interface(auto: bool, apres=None) -> None:
             barre.pack(fill="x")
             self.recherche = tk.StringVar()
             self.recherche.trace_add("write", lambda *_: self._remplir())
-            ttk.Label(barre, text="Rechercher", style="Doux.TLabel").pack(side="left", padx=(0, 8))
+            ttk.Label(barre, text=T("Rechercher"), style="Doux.TLabel").pack(side="left", padx=(0, 8))
             self.champ = ttk.Entry(barre, textvariable=self.recherche)
             self.champ.pack(side="left", fill="x", expand=True)
-            self.filtre = tk.StringVar(value=FILTRES[0])
-            cb = ttk.Combobox(barre, textvariable=self.filtre, values=FILTRES, state="readonly", width=15)
+            self.filtre = tk.StringVar(value=T(FILTRES[0][1]))
+            cb = ttk.Combobox(barre, textvariable=self.filtre, values=[T(l) for _, l in FILTRES],
+                              state="readonly", width=15)
             cb.pack(side="left", padx=(10, 0))
             cb.bind("<<ComboboxSelected>>", lambda e: (self._remplir(), self.arbre.focus_set()))
-            self.b_groupes = ttk.Button(barre, text="Groupes  ▾", command=self._menu_groupes)
+            self.b_groupes = ttk.Button(barre, text=T("Groupes  ▾"), command=self._menu_groupes)
             self.b_groupes.pack(side="left", padx=(10, 0))
-            ttk.Button(barre, text="Tout décocher", command=self._tout_decocher).pack(side="left", padx=(10, 0))
+            ttk.Button(barre, text=T("Tout décocher"), command=self._tout_decocher).pack(side="left", padx=(10, 0))
 
             # pied (placé avant la liste pour qu'il reste visible quand on rétrécit la fenêtre)
             pied = ttk.Frame(r, padding=(m18, int(10 * k), m18, int(14 * k)))
             pied.pack(side="bottom", fill="x")
             self.etat = ttk.Label(pied, style="Doux.TLabel")
             self.etat.pack(side="left", fill="x", expand=True)
-            self.bouton = ttk.Button(pied, text="▶  Démarrer le farm", style="Accent.TButton",
+            self.bouton = ttk.Button(pied, text=T("▶  Démarrer le farm"), style="Accent.TButton",
                                      command=self._marche_arret)
             self.bouton.pack(side="right")
             ttk.Frame(r, style="Ligne.TFrame", height=1).pack(side="bottom", fill="x", padx=m18)
@@ -789,11 +997,11 @@ def interface(auto: bool, apres=None) -> None:
             milieu.pack(fill="both", expand=True)
             self.arbre = ttk.Treeview(milieu, columns=("temps", "objectif", "farme"), show="tree headings",
                                       selectmode="extended")
-            self.arbre.heading("#0", text="Jeu", anchor="w", command=lambda: self._trier("nom"))
+            self.arbre.heading("#0", text=T("Jeu"), anchor="w", command=lambda: self._trier("nom"))
             self.arbre.column("#0", width=int(420 * k), stretch=True)
             for col, titre, larg in (("temps", "Temps Steam", 120), ("objectif", "Objectif", 140),
                                      ("farme", "Farmé ici", 140)):
-                self.arbre.heading(col, text=titre, anchor="e", command=lambda c=col: self._trier(c))
+                self.arbre.heading(col, text=T(titre), anchor="e", command=lambda c=col: self._trier(c))
                 self.arbre.column(col, width=int(larg * k), anchor="e", stretch=False)
             sb = ttk.Scrollbar(milieu, orient="vertical", command=self.arbre.yview)
             self.arbre.configure(yscrollcommand=sb.set)
@@ -817,6 +1025,34 @@ def interface(auto: bool, apres=None) -> None:
                                 disabledforeground=GRIS)
             self.menu = tk.Menu(r, **options_menu)
             self.menu_sup = tk.Menu(self.menu, **options_menu)
+
+        def _changer_langue(self, code: str):
+            """Reconstruit toute la fenêtre dans l'autre langue, sans arrêter le farm."""
+            global LANGUE
+            if code == LANGUE or code not in ("fr", "en"):
+                return
+            LANGUE = code
+            self.cfg["langue"] = code
+            sel = self.sel
+            for w in self.r.winfo_children():
+                w.destroy()
+            self.fen_stats = self.fen_options = None
+            self.r.title(T("Farm d'heures Steam"))
+            self._construire()
+            if self.actif:
+                self.bouton.config(text=T("■  Arrêter le farm"), style="Arret.TButton")
+            self.sel = None
+            self._maj_sous_titre()
+            self._remplir()
+            if sel and self.arbre.exists(str(sel)):
+                self.arbre.selection_set(str(sel))
+                self.arbre.see(str(sel))
+            self._planifier_banniere()
+            if self.tray:
+                self.tray.title = T("Farm d'heures Steam")
+            self._maj_menu_tray()
+            self._sauver()
+            self._ouvrir_options()
 
         # ── petites fenêtres ──
         def _dialogue(self, titre: str, message: str, boutons, saisie: str | None = None):
@@ -869,65 +1105,92 @@ def interface(auto: bool, apres=None) -> None:
             w = tk.Toplevel(self.r)
             w.title(titre)
             w.configure(bg=FOND)
-            w.geometry(f"{int(taille[0] * self.k)}x{int(taille[1] * self.k)}")
+            self._taille(w, *taille)
             setattr(self, attr, w)
             self._barre_sombre(w)
             return w
 
         def _ouvrir_options(self):
-            w = self._fenetre("fen_options", "Options", (560, 520))
+            w = self._fenetre("fen_options", T("Options"), (620, 750))
             if w is None:
                 return
             k = self.k
-            f = ttk.Frame(w, padding=int(20 * k))
+            f = ttk.Frame(w, padding=(int(22 * k), int(16 * k)))
             f.pack(fill="both", expand=True)
+            # boutons du bas placés en premier : sur un petit écran, c'est le contenu qui rétrécit, pas eux
+            bas = ttk.Frame(f)
+            bas.pack(fill="x", side="bottom")
+            ttk.Label(bas, text=T("Version {v}", v=VERSION), style="Gris.TLabel").pack(side="left")
+            ttk.Button(bas, text=T("Fermer"), command=w.destroy).pack(side="right")
+            ttk.Button(bas, text=T("Page du projet"), command=lambda: os.startfile(PROJET)).pack(side="right", padx=8)
 
-            def ligne(texte, var, apres, de=0, a=9999, pas=1):
+            def titre(texte, trait=True):
+                if trait:
+                    ttk.Frame(f, style="Ligne.TFrame", height=1).pack(fill="x", pady=(int(2 * k), int(12 * k)))
+                ttk.Label(f, text=texte, style="Section.TLabel").pack(anchor="w", pady=(0, int(8 * k)))
+
+            def spin(parent, var, de, a):
+                sp = ttk.Spinbox(parent, from_=de, to=a, increment=1, width=5, textvariable=var, command=self._sauver)
+                sp.bind("<FocusOut>", lambda e: self._sauver())
+                return sp
+
+            def ligne(avant, var, apres):
                 l = ttk.Frame(f)
                 l.pack(fill="x", pady=(0, 6))
-                ttk.Label(l, text=texte).pack(side="left")
-                sp = ttk.Spinbox(l, from_=de, to=a, increment=pas, width=5, textvariable=var, command=self._sauver)
-                sp.pack(side="left", padx=6)
-                sp.bind("<FocusOut>", lambda e: self._sauver())
+                ttk.Label(l, text=avant).pack(side="left")
+                spin(l, var, 0, 9999).pack(side="left", padx=6)
                 ttk.Label(l, text=apres, style="Doux.TLabel").pack(side="left")
 
+            def case(texte, var, cmd=None):
+                ttk.Checkbutton(f, text=texte, variable=var, command=cmd or self._sauver).pack(anchor="w", pady=(0, 4))
+
             def note(texte):
-                ttk.Label(f, text=texte, style="Gris.TLabel", wraplength=int(500 * k)).pack(anchor="w", pady=(0, 12))
+                ttk.Label(f, text=texte, style="Gris.TLabel", wraplength=int(560 * k),
+                          justify="left").pack(anchor="w", pady=(0, int(10 * k)))
 
-            ttk.Label(f, text="Farm", style="Section.TLabel").pack(anchor="w", pady=(0, 8))
-            ligne("Arrêter le farm automatiquement après", self.duree, "h  (0 = jamais)")
-            ligne("Rotation : changer de groupe de jeux toutes les", self.rotation, "h  (0 = jamais)")
-            note(f"Steam accepte {MAX_SIMULTANES} jeux à la fois. Si tu en coches plus, l'appli les fait "
-                 "tourner par groupes de 32 et passe au groupe suivant à chaque rotation.")
-            ttk.Checkbutton(f, text="Garder le PC éveillé pendant le farm", variable=self.eveille,
-                            command=self._sauver).pack(anchor="w", pady=(0, 6))
-            ttk.Checkbutton(f, text="Lancer avec Windows", variable=self.au_demarrage,
-                            command=self._regler_demarrage).pack(anchor="w")
-            note("Au démarrage du PC, l'appli s'ouvre cachée dans la zone de notification, attend que Steam "
-                 "soit connecté, puis farme tes jeux cochés.")
+            titre(T("Farm"), trait=False)
+            ligne(T("Arrêter le farm automatiquement après"), self.duree, T("h  (0 = jamais)"))
+            ligne(T("Rotation : changer de groupe de jeux toutes les"), self.rotation, T("h  (0 = jamais)"))
+            note(T("Steam accepte {n} jeux à la fois. Si tu en coches plus, l'appli les fait tourner par groupes "
+                   "et passe au groupe suivant à chaque rotation.", n=MAX_SIMULTANES))
+            case(T("Garder le PC éveillé pendant le farm"), self.eveille)
 
-            ttk.Frame(f, style="Ligne.TFrame", height=1).pack(fill="x", pady=(4, 14))
-            ttk.Label(f, text="Ajouter un jeu par son AppID", style="Section.TLabel").pack(anchor="w", pady=(0, 8))
+            titre(T("Quand farmer"))
+            l = ttk.Frame(f)
+            l.pack(fill="x", pady=(0, 4))
+            ttk.Checkbutton(l, text=T("Farmer seulement quand je n'utilise pas le PC, après"),
+                            variable=self.si_inactif, command=self._sauver).pack(side="left")
+            spin(l, self.inactif_min, 1, 600).pack(side="left", padx=6)
+            ttk.Label(l, text=T("min sans activité"), style="Doux.TLabel").pack(side="left")
+            case(T("Mettre le farm en pause quand je lance un vrai jeu"), self.pause_jeu)
+            case(T("Passer en invisible sur Steam pendant le farm"), self.invisible, self._regler_invisible)
+            note(T("En invisible, tes amis ne te voient plus « En jeu ». Ton statut d'avant revient quand le farm "
+                   "s'arrête."))
+            case(T("Lancer avec Windows"), self.au_demarrage, self._regler_demarrage)
+            note(T("Au démarrage du PC, l'appli s'ouvre cachée dans la zone de notification, attend que Steam "
+                   "soit connecté, puis farme tes jeux cochés."))
+
+            titre(T("Langue"))
+            langue = tk.StringVar(value=dict(LANGUES)[LANGUE])
+            cb = ttk.Combobox(f, textvariable=langue, values=[n for _, n in LANGUES], state="readonly", width=14)
+            cb.pack(anchor="w", pady=(0, int(12 * k)))
+            cb.bind("<<ComboboxSelected>>", lambda e: self.r.after(
+                10, lambda: self._changer_langue(next(c for c, n in LANGUES if n == langue.get()))))
+
+            titre(T("Ajouter un jeu par son AppID"))
             l = ttk.Frame(f)
             l.pack(fill="x")
             self.ajout = tk.StringVar()
             e = ttk.Entry(l, textvariable=self.ajout, width=12)
             e.pack(side="left")
             e.bind("<Return>", lambda _: self._ajouter())
-            ttk.Button(l, text="Ajouter", command=self._ajouter).pack(side="left", padx=(8, 0))
-            note("Pour un jeu absent de la liste. L'AppID est le nombre dans l'adresse de sa page Steam "
-                 "(store.steampowered.com/app/730 → 730).")
-
-            ttk.Frame(f, style="Ligne.TFrame", height=1).pack(fill="x", pady=(4, 14))
-            bas = ttk.Frame(f)
-            bas.pack(fill="x", side="bottom")
-            ttk.Label(bas, text=f"Version {VERSION}", style="Gris.TLabel").pack(side="left")
-            ttk.Button(bas, text="Fermer", command=w.destroy).pack(side="right")
-            ttk.Button(bas, text="Page du projet", command=lambda: os.startfile(PROJET)).pack(side="right", padx=8)
+            ttk.Button(l, text=T("Ajouter"), command=self._ajouter).pack(side="left", padx=(8, 0))
+            note(T("Pour un jeu absent de la liste. L'AppID est le nombre dans l'adresse de sa page Steam "
+                   "(store.steampowered.com/app/730 → 730)."))
 
         # ── statistiques ──
         def _ouvrir_stats(self):
-            w = self._fenetre("fen_stats", "Statistiques", (800, 760))
+            w = self._fenetre("fen_stats", T("Statistiques"), (800, 760))
             if w is None:
                 return
             k = self.k
@@ -939,17 +1202,17 @@ def interface(auto: bool, apres=None) -> None:
                                               ("total", "Total farmé avec l'appli"))):
                 t = ttk.Frame(haut, style="Tuile.TFrame", padding=(int(14 * k), int(10 * k)))
                 t.pack(side="left", fill="x", expand=True, padx=(0 if i == 0 else int(10 * k), 0))
-                ttk.Label(t, text=titre, style="TuileTitre.TLabel").pack(anchor="w")
+                ttk.Label(t, text=T(titre), style="TuileTitre.TLabel").pack(anchor="w")
                 self.tuiles[cle] = ttk.Label(t, style="TuileValeur.TLabel")
                 self.tuiles[cle].pack(anchor="w")
-            ttk.Label(w, text="Heures farmées par jour · 30 derniers jours", style="Section.TLabel",
+            ttk.Label(w, text=T("Heures farmées par jour · 30 derniers jours"), style="Section.TLabel",
                       padding=(m18, int(18 * k), m18, int(6 * k))).pack(anchor="w")
             self.graphe = tk.Canvas(w, height=int(220 * k), bg=FOND, highlightthickness=0)
             self.graphe.pack(fill="x", padx=m18)
             self.graphe.bind("<Configure>", lambda e: self._dessiner_graphe())
             self.graphe.bind("<Motion>", self._survol_graphe)
             self.graphe.bind("<Leave>", lambda e: self._survol_graphe(None))
-            ttk.Label(w, text="Jeux les plus farmés", style="Section.TLabel",
+            ttk.Label(w, text=T("Jeux les plus farmés"), style="Section.TLabel",
                       padding=(m18, int(18 * k), m18, int(6 * k))).pack(anchor="w")
             self.top = tk.Canvas(w, bg=FOND, highlightthickness=0)
             self.top.pack(fill="both", expand=True, padx=m18, pady=(0, m18))
@@ -970,10 +1233,10 @@ def interface(auto: bool, apres=None) -> None:
             if w is None or not w.winfo_exists():
                 return
             jours = self._jours(30)
-            self.tuiles["jour"].config(text=heures(jours[-1][1] / 60, "0 h 00"))
-            self.tuiles["semaine"].config(text=heures(sum(j[1] for j in jours[-7:]) / 60, "0 h 00"))
+            self.tuiles["jour"].config(text=heures(jours[-1][1] / 60, None))
+            self.tuiles["semaine"].config(text=heures(sum(j[1] for j in jours[-7:]) / 60, None))
             total = sum(self._total(a) for a in set(self.farme) | set(self.procs))
-            self.tuiles["total"].config(text=heures(total / 60, "0 h 00"))
+            self.tuiles["total"].config(text=heures(total / 60, None))
             self._dessiner_graphe()
             self._dessiner_top()
             if getattr(self, "_stats_apres", None):
@@ -993,7 +1256,7 @@ def interface(auto: bool, apres=None) -> None:
             if vmax <= 0:
                 c.create_line(g, H - b, W, H - b, fill=BORD)
                 c.create_text((g + W) / 2, (H - b) / 2, fill=GRIS, font=("Segoe UI", 10),
-                              text="Pas encore d'heures farmées. Lance le farm pour voir tes stats ici.")
+                              text=T("Pas encore d'heures farmées. Lance le farm pour voir tes stats ici."))
                 return
             pas = next(p for p in (0.25, 0.5, 1, 2, 5, 10, 20, 25, 50, 100, 200, 250, 500, 1000)
                        if vmax / p <= 4)
@@ -1002,8 +1265,8 @@ def interface(auto: bool, apres=None) -> None:
             for i in range(int(round(ymax / pas)) + 1):
                 y = H - b - i * pas / ymax * hauteur
                 c.create_line(g, y, W, y, fill=BORD if i else "#3a4150")
-                c.create_text(g - int(8 * k), y, text=f"{court(i * pas).replace('.', ',')} h", anchor="e", fill=GRIS,
-                              font=("Segoe UI", 8))
+                c.create_text(g - int(8 * k), y, text=nombre_txt(i * pas) + ("h" if LANGUE == "en" else " h"),
+                              anchor="e", fill=GRIS, font=("Segoe UI", 8))
             fente = (W - g) / len(jours)
             larg = max(3.0, min(fente * 0.62, 26 * k))
             for i, (d, v, n) in enumerate(jours):
@@ -1012,8 +1275,11 @@ def interface(auto: bool, apres=None) -> None:
                 barre = barre_arrondie(c, x0, H - b - hpx, x0 + larg, H - b, 4 * k, fill=BARRE) if v > 0 else None
                 self._barres.append((g + i * fente, g + (i + 1) * fente, d, v, n, barre, x0 + larg / 2, H - b - hpx))
                 if i % 7 == len(jours) % 7 - 1 or i == len(jours) - 1:
-                    c.create_text(x0 + larg / 2, H - b + int(12 * k), fill=GRIS, font=("Segoe UI", 8),
-                                  text="auj." if i == len(jours) - 1 else d.strftime("%d/%m"))
+                    it = c.create_text(x0 + larg / 2, H - b + int(12 * k), fill=GRIS, font=("Segoe UI", 8),
+                                       text=T("auj.") if i == len(jours) - 1 else date_courte(d))
+                    bx = c.bbox(it)
+                    if bx and bx[2] > W - 1:          # étiquette du dernier jour : ne pas dépasser le bord
+                        c.move(it, W - 1 - bx[2], 0)
 
         def _survol_graphe(self, e):
             c = self.graphe
@@ -1027,9 +1293,9 @@ def interface(auto: bool, apres=None) -> None:
                 if x0 <= e.x < x1:
                     if barre:
                         c.itemconfig(barre, fill=ACCENT)
-                    texte = f"{JOURS[d.weekday()]} {d.strftime('%d/%m')} : {heures(v / 60, '0 h 00')}"
+                    texte = T("{j} {d} : {h}", j=jour_court(d), d=date_courte(d), h=heures(v / 60, None))
                     if n:
-                        texte += f" · {n} jeu{'x' if n > 1 else ''}"
+                        texte += pluriel(n, " · {n} jeu", " · {n} jeux")
                     W = c.winfo_width()
                     t = c.create_text(0, 0, text=texte, fill=TEXTE, font=("Segoe UI", 9), anchor="s", tags="bulle")
                     bx = c.bbox(t)
@@ -1051,7 +1317,7 @@ def interface(auto: bool, apres=None) -> None:
                             reverse=True)[:10]
             if not totaux:
                 c.create_text(0, int(10 * k), anchor="nw", fill=GRIS, font=("Segoe UI", 10),
-                              text="Aucun jeu farmé pour l'instant.")
+                              text=T("Aucun jeu farmé pour l'instant."))
                 return
             self._top_imgs = []
             pas, nom_l, val_l = int(28 * k), int(250 * k), int(80 * k)
@@ -1062,7 +1328,7 @@ def interface(auto: bool, apres=None) -> None:
                     im = ImageTk.PhotoImage(self.icones[a].resize((int(20 * k), int(20 * k))))
                     self._top_imgs.append(im)
                     c.create_image(0, y, image=im, anchor="w")
-                nom = self.jeux.get(a, {}).get("nom") or self.infos.get(a, (f"App {a}",))[0]
+                nom = self._nom(a)
                 c.create_text(int(30 * k), y, text=nom if len(nom) < 30 else nom[:28] + "…", anchor="w",
                               fill=TEXTE, font=("Segoe UI", 10))
                 larg = max(4 * k, (W - nom_l - val_l) * v / vmax)
@@ -1077,23 +1343,23 @@ def interface(auto: bool, apres=None) -> None:
             try:
                 M = pystray.MenuItem
                 menu = pystray.Menu(
-                    M("Ouvrir", lambda: self.q.put(self._montrer), default=True),
-                    M(lambda _: "Arrêter le farm" if self.actif else "Démarrer le farm",
+                    M(lambda _: T("Ouvrir"), lambda: self.q.put(self._montrer), default=True),
+                    M(lambda _: T("Arrêter le farm") if self.actif else T("Démarrer le farm"),
                       lambda: self.q.put(self._marche_arret)),
-                    M("Statistiques", lambda: self.q.put(lambda: (self._montrer(), self._ouvrir_stats()))),
+                    M(lambda _: T("Statistiques"), lambda: self.q.put(lambda: (self._montrer(), self._ouvrir_stats()))),
                     pystray.Menu.SEPARATOR,
-                    M("Quitter", lambda: self.q.put(self._quitter)))
-                self.tray = pystray.Icon(NOM_RUN, dessiner_logo(64), "Farm d'heures Steam", menu)
+                    M(lambda _: T("Quitter"), lambda: self.q.put(self._quitter)))
+                self.tray = pystray.Icon(NOM_RUN, dessiner_logo(64), T("Farm d'heures Steam"), menu)
                 self.tray.run_detached()
             except Exception as e:  # noqa: BLE001
-                journal(f"icône de notification impossible : {e!r}")
+                journal(T("icône de notification impossible : {e}", e=repr(e)))
                 self.tray = None
 
         def _notifier(self, texte: str):
             journal(texte)
             if self.tray:
                 try:
-                    self.tray.notify(texte, "Farm d'heures Steam")
+                    self.tray.notify(texte, T("Farm d'heures Steam"))
                 except Exception:
                     pass
 
@@ -1116,7 +1382,7 @@ def interface(auto: bool, apres=None) -> None:
                 self.r.withdraw()
                 if not self.notifie:
                     self.notifie = True
-                    self._notifier("Le farm continue. Clic sur l'icône pour rouvrir, clic droit pour quitter.")
+                    self._notifier(T("Le farm continue. Clic sur l'icône pour rouvrir, clic droit pour quitter."))
                 return
             self._quitter()
 
@@ -1133,15 +1399,51 @@ def interface(auto: bool, apres=None) -> None:
         def _regler_demarrage(self):
             try:
                 regler_demarrage_windows(self.au_demarrage.get())
-                self.etat.config(text="Au démarrage de Windows : l'appli s'ouvre cachée et lance le farm des jeux cochés."
-                                 if self.au_demarrage.get() else "Ne se lance plus avec Windows.")
+                self.etat.config(text=T("Au démarrage de Windows, l'appli s'ouvre cachée et farme les jeux cochés.")
+                                 if self.au_demarrage.get() else T("Ne se lance plus avec Windows."))
             except OSError as e:
                 self.au_demarrage.set(demarrage_windows())
-                self.etat.config(text=f"Impossible de régler le démarrage : {e}")
+                self.etat.config(text=T("Impossible de régler le démarrage : {e}", e=e))
+
+        # ── statut Steam (mode invisible) ──
+        # Un lien steam:// ouvre Steam s'il est fermé : on ne touche au statut que si Steam tourne et est connecté.
+        def _passer_invisible(self):
+            if not steam_pret():
+                return                           # refait à la reprise, quand Steam sera revenu
+            if self.statut_avant is None:
+                try:
+                    steam = self.steam or dossier_steam()
+                except OSError:
+                    steam = None
+                avant = statut_steam(steam) if steam else None
+                if avant in (INVISIBLE, 0):
+                    return                       # déjà invisible ou hors ligne : rien à faire, rien à remettre
+                self.statut_avant = avant if avant is not None else 1
+            changer_statut(INVISIBLE)
+            self._sauver()
+
+        def _restaurer_statut(self):
+            if self.statut_avant is None or not steam_pret():
+                return                           # Steam fermé : statut_avant reste enregistré, remis plus tard
+            changer_statut(self.statut_avant)
+            self.statut_avant = None
+            self._sauver()
+
+        def _appliquer_statut(self):
+            """Statut voulu pour l'état actuel : invisible pendant le farm si l'option est cochée, sinon celui d'avant."""
+            if self.actif and self.invisible.get():
+                self._passer_invisible()
+            else:
+                self._restaurer_statut()
+
+        def _regler_invisible(self):
+            self._sauver()
+            if self.actif:
+                self._appliquer_statut()
 
         # ── chargement de la bibliothèque (dans un fil à part) ──
         def _recharger(self):
-            self.sous_titre.config(text="lecture de ta bibliothèque…")
+            self.sous_titre.config(text=T("lecture de ta bibliothèque…"))
             threading.Thread(target=self._charger, daemon=True).start()
 
         def _charger(self):
@@ -1163,8 +1465,8 @@ def interface(auto: bool, apres=None) -> None:
                 if preparer_dll(steam):
                     verif = verifier_possession(sorted(jeux))
                     if verif is None:
-                        note = "Steam fermé ? liste " + ("du dernier lancement" if self.cfg.get("possedes")
-                                                         else "non vérifiée")
+                        note = ("Steam fermé ? liste du dernier lancement" if self.cfg.get("possedes")
+                                else "Steam fermé ? liste non vérifiée")
                 else:
                     note = "steam_api64.dll introuvable : le farm ne pourra pas démarrer"
                 filtre = verif["possedes"] if verif else set(self.cfg.get("possedes", [])) or None
@@ -1176,14 +1478,14 @@ def interface(auto: bool, apres=None) -> None:
                 icones = {a: icone_jeu(chemins[a].get("icone"), infos.get(a, ("?",))[0], s) for a in jeux}
                 self.chargement = (steam, jeux, infos, temps, installes, verif, chemins, icones, note, None)
             except Exception as e:  # noqa: BLE001 — affiché dans la fenêtre
-                journal(f"chargement : {e!r}")
+                journal(T("chargement : {e}", e=repr(e)))
                 self.chargement = (None, set(), {}, {}, set(), None, {}, {}, "", repr(e))
 
         def _appliquer_chargement(self):
             steam, jeux, infos, temps, installes, verif, chemins, icones, note, err = self.chargement
             self.chargement = None
             if err:
-                self.sous_titre.config(text=f"impossible de lire Steam : {err}")
+                self.sous_titre.config(text=T("impossible de lire Steam : {e}", e=err))
                 return
             self.steam, self.infos, self.installes = steam, infos, installes
             self.gratuits = {a for a, i in infos.items() if i[2]}
@@ -1206,16 +1508,22 @@ def interface(auto: bool, apres=None) -> None:
                     self.arbre.selection_set(premier)
                     self.arbre.see(premier)
 
-        def _maj_sous_titre(self, note: str = ""):
+        def _maj_sous_titre(self, note: str | None = None):
+            """note : message du dernier chargement ("" l'efface) ; None garde le message actuel."""
             n = sum(1 for a in self.coches if a in self.jeux)
-            txt = f"{len(self.jeux)} jeux  ·  {n} coché{'s' if n > 1 else ''}"
-            if note:
+            txt = pluriel(len(self.jeux), "{n} jeu", "{n} jeux") + "  ·  " + pluriel(n, "{n} coché", "{n} cochés")
+            if note is not None:
                 self._note = note
-            if getattr(self, "_note", ""):
-                txt += f"  ·  {self._note}"
+            if self._note:
+                txt += "  ·  " + T(self._note)
             self.sous_titre.config(text=txt)
 
         # ── calculs ──
+        def _nom(self, a: int | None) -> str:
+            if a is None:
+                return ""
+            return self.jeux.get(a, {}).get("nom") or self.infos.get(a, (f"App {a}",))[0]
+
         def _total(self, a: int) -> float:
             """Secondes farmées avec l'appli (depuis toujours), session en cours comprise."""
             p = self.procs.get(a)
@@ -1232,6 +1540,22 @@ def interface(auto: bool, apres=None) -> None:
             h = self.objectifs.get(a, 0)
             return h > 0 and self._temps_steam(a) >= h * 3600
 
+        def _fin_estimee(self, a: int) -> tuple[float, float | None] | None:
+            """(secondes restantes, heure de fin estimée ou None si on ne peut pas l'estimer)."""
+            obj = self.objectifs.get(a, 0)
+            reste = obj * 3600 - self._temps_steam(a)
+            if obj <= 0 or reste <= 0:
+                return None
+            vitesse = 0.0
+            if self.actif and not self.pause and a in self.coches and a not in self.echecs and not self._a_confirmer(a):
+                n = sum(1 for b in self.coches if b in self.jeux and b not in self.echecs
+                        and not self._objectif_atteint(b) and not self._a_confirmer(b))
+                if n <= MAX_SIMULTANES:
+                    vitesse = 1.0
+                elif nombre(self.rotation.get()) > 0:
+                    vitesse = MAX_SIMULTANES / n     # le jeu ne tourne qu'une partie du temps
+            return reste, (time.time() + reste / vitesse if vitesse else None)
+
         def _remboursable(self, a: int) -> bool:
             t = self.achats.get(a)
             return (bool(t) and a not in self.gratuits and a not in self.famille
@@ -1242,9 +1566,21 @@ def interface(auto: bool, apres=None) -> None:
 
         def _texte_remb(self, a: int) -> str:
             jours = int((time.time() - self.achats[a]) // 86400)
-            reste = max(0, REMB_SECONDES - self._temps_steam(a))
-            return (f"acheté il y a {jours} jour{'s' if jours > 1 else ''}, "
-                    f"encore {heures(reste / 60, '0 h 00')} avant la limite de 2 h")
+            reste = heures(max(0, REMB_SECONDES - self._temps_steam(a)) / 60, None)
+            return pluriel(jours, "acheté il y a {n} jour, encore {r} avant la limite de 2 h",
+                           "acheté il y a {n} jours, encore {r} avant la limite de 2 h", r=reste)
+
+        def _texte_echec(self, a: int) -> str:
+            v = self.echecs.get(a)
+            return T("refusé par Steam") if v == "refus" else T("arrêté (code {c})", c=v)
+
+        def _texte_pause(self) -> str:
+            if self.pause == "steam":
+                return T("⏸  Steam est fermé : le farm reprendra tout seul dès que Steam sera de retour")
+            if self.pause == "jeu":
+                return T("⏸  En pause pendant que tu joues à {nom}", nom=self.jeu_reel[1] if self.jeu_reel else "?")
+            return T("⏸  En pause : tu utilises le PC. Le farm reprend après {n} min sans activité",
+                     n=nombre_txt(nombre(self.inactif_min.get())))
 
         # ── images ──
         def _chemins(self, a: int) -> dict:
@@ -1288,6 +1624,8 @@ def interface(auto: bool, apres=None) -> None:
         def _rendre_banniere(self):
             self._rendu_prevu = None
             c, k = self.ban, self.k
+            if not c.winfo_exists():
+                return
             w, h = c.winfo_width(), c.winfo_height()
             if w < 50:
                 return
@@ -1321,7 +1659,7 @@ def interface(auto: bool, apres=None) -> None:
                     pass
             self._ban_tk = ImageTk.PhotoImage(base)
             c.itemconfig(self.b_img, image=self._ban_tk)
-            nom = self.jeux[a]["nom"] if a in self.jeux else ("Farm d'heures Steam" if not a else f"App {a}")
+            nom = self.jeux[a]["nom"] if a in self.jeux else (T("Farm d'heures Steam") if not a else f"App {a}")
             c.itemconfig(self.b_nom, text="" if a_logo else nom, width=int(w * .6))
             c.coords(self.b_nom, marge, bas_logo)
             c.coords(self.b_stats, marge, bas_logo + int(12 * k))
@@ -1341,38 +1679,37 @@ def interface(auto: bool, apres=None) -> None:
         def _maj_banniere_textes(self):
             a, c, k = self.sel, self.ban, self.k
             if a not in self.jeux:
-                c.itemconfig(self.b_stats, text="Coche des jeux dans la liste, puis Démarrer le farm.")
+                c.itemconfig(self.b_stats, text=T("Coche des jeux dans la liste, puis Démarrer le farm."))
                 c.itemconfig(self.b_etat, text="")
                 for item in (self.b_piste, self.b_jauge, self.b_pct):
                     c.itemconfig(item, state="hidden")
                 return
-            j = self.jeux[a]
             farme = hms(self._total(a)) if a in self.procs else heures(self._total(a) / 60)
-            c.itemconfig(self.b_stats, text=f"Temps Steam  {heures(self._temps_steam(a) / 60)}      "
-                                            f"Farmé ici  {farme}      AppID  {a}")
+            c.itemconfig(self.b_stats, text=T("Temps Steam  {t}      Farmé ici  {f}      AppID  {a}",
+                                              t=heures(self._temps_steam(a) / 60), f=farme, a=a))
             remb = self._remboursable(a)
             if a in self.procs:
-                txt, coul = f"▶  En cours depuis {hms(time.time() - self.procs[a][1])}", VERT
+                txt, coul = T("▶  En cours depuis {d}", d=hms(time.time() - self.procs[a][1])), VERT
                 if remb:
-                    txt, coul = txt + f"  ·  ⚠ remboursable : {self._texte_remb(a)}", ORANGE
-            elif a in self.coches and self.pause_steam:
-                txt, coul = "⏸  En pause : Steam est fermé, reprise automatique dès son retour", ORANGE
+                    txt, coul = txt + T("  ·  ⚠ remboursable : {r}", r=self._texte_remb(a)), ORANGE
+            elif a in self.coches and self.pause:
+                txt, coul = self._texte_pause(), ORANGE
             elif a in self.echecs:
-                txt, coul = f"✗  {self.echecs[a]} (voir journal.txt)", ROUGE
+                txt, coul = T("✗  {e} (voir journal.txt)", e=self._texte_echec(a)), ROUGE
             elif a in self.essais:
-                txt, coul = "↻  Steam a refusé, nouvel essai dans quelques secondes", ORANGE
+                txt, coul = T("↻  Steam a refusé, nouvel essai dans quelques secondes"), ORANGE
             elif a in self.atteints and a not in self.coches:
-                txt, coul = f"✓  Objectif atteint ({objectif_txt(self.objectifs.get(a, 0))})", VERT
+                txt, coul = T("✓  Objectif atteint ({o})", o=objectif_txt(self.objectifs.get(a, 0))), VERT
             elif remb:
-                txt, coul = f"⚠  Encore remboursable : {self._texte_remb(a)}", ORANGE
+                txt, coul = T("⚠  Encore remboursable : {r}", r=self._texte_remb(a)), ORANGE
             elif a in self.coches:
-                txt = "✓  Dans le farm" + (" — en attente d'une place (32 jeux max)" if self.actif
-                                           else " — démarre avec le bouton en bas")
+                txt = T("✓  Dans le farm — en attente d'une place (32 jeux max)") if self.actif \
+                    else T("✓  Dans le farm — démarre avec le bouton en bas")
                 coul = ACCENT
             else:
-                txt, coul = "Pas dans le farm", GRIS
+                txt, coul = T("Pas dans le farm"), GRIS
             c.itemconfig(self.b_etat, text=txt, fill=coul)
-            self.b_farm.config(text="Retirer du farm" if a in self.coches else "＋  Ajouter au farm",
+            self.b_farm.config(text=T("Retirer du farm") if a in self.coches else T("＋  Ajouter au farm"),
                                style="Verre.TButton" if a in self.coches else "Accent.TButton")
             # jauge de l'objectif
             obj = self.objectifs.get(a, 0)
@@ -1385,8 +1722,14 @@ def interface(auto: bool, apres=None) -> None:
                 c.coords(self.b_jauge, x, y - ep / 2, x + max(1, L * p), y + ep / 2)
                 c.itemconfig(self.b_jauge, fill=VERT if p >= 1 else ACCENT)
                 c.coords(self.b_pct, x + L + int(10 * k), y)
-                c.itemconfig(self.b_pct, text=f"{int(p * 100)} %  ·  {heures(self._temps_steam(a) / 60)} "
-                                              f"sur {objectif_txt(obj)}")
+                txt = pct(int(p * 100)) + "  ·  " + T("{t} sur {o}", t=heures(self._temps_steam(a) / 60),
+                                                      o=objectif_txt(obj))
+                fin = self._fin_estimee(a)
+                if fin:
+                    reste, quand = fin
+                    txt += "  ·  " + (T("fin prévue {m}", m=moment(quand)) if quand
+                                      else T("reste {r}", r=heures(reste / 60, None)))
+                c.itemconfig(self.b_pct, text=txt)
                 for item in (self.b_piste, self.b_jauge, self.b_pct):
                     c.itemconfig(item, state="normal")
             else:
@@ -1402,9 +1745,10 @@ def interface(auto: bool, apres=None) -> None:
         def _regler_objectif(self):
             if self._maj_objectif or self.sel not in self.jeux:
                 return
-            h = nombre(self.obj_var.get())
-            if h != self.objectifs.get(self.sel, 0):
-                self._definir_objectif([self.sel], h)
+            texte, actuel = self.obj_var.get().strip(), self.objectifs.get(self.sel, 0)
+            if texte == court(actuel) or nombre(texte) == actuel:
+                return       # le champ montre 2 décimales : 1.83 pour 1 h 50 (1.8333) ne doit pas changer l'objectif
+            self._definir_objectif([self.sel], nombre(texte))
 
         def _definir_objectif(self, ids, h: float):
             for a in ids:
@@ -1422,22 +1766,22 @@ def interface(auto: bool, apres=None) -> None:
         def _valeurs(self, a: int):
             if a in self.procs:
                 f = "▶  " + hms(self._total(a))
-            elif a in self.coches and self.pause_steam:
-                f = "⏸  pause"
+            elif a in self.coches and self.pause:
+                f = T("⏸  pause")
             elif a in self.echecs:
-                f = "✗  refusé"
+                f = T("✗  refusé")
             elif a in self.essais:
-                f = "↻  nouvel essai"
+                f = T("↻  nouvel essai")
             elif a in self.coches and self._a_confirmer(a):
-                f = "⚠  à confirmer"
+                f = T("⚠  à confirmer")
             elif a in self.coches and self.actif:
-                f = "en attente"
+                f = T("en attente")
             else:
                 f = heures(self._total(a) / 60)
             obj = self.objectifs.get(a, 0)
             if obj > 0:
                 p = self._temps_steam(a) / (obj * 3600)
-                o = f"✓  {objectif_txt(obj)}" if p >= 1 else f"{int(p * 100)} %  de {objectif_txt(obj)}"
+                o = f"✓  {objectif_txt(obj)}" if p >= 1 else T("{p}  de {o}", p=pct(int(p * 100)), o=objectif_txt(obj))
             else:
                 o = ""
             return (heures(self._temps_steam(a) / 60), o, f)
@@ -1449,17 +1793,21 @@ def interface(auto: bool, apres=None) -> None:
                 return ("echec",)
             if self._remboursable(a):
                 return ("remb",)
-            if a in self.coches and (self.actif or self.pause_steam):
+            if a in self.coches and (self.actif or self.pause):
                 return ("attente",)
             return () if a in self.coches else ("off",)
+
+        def _filtre_cle(self) -> str:
+            v = self.filtre.get()
+            return next((c for c, l in FILTRES if T(l) == v), "tous")
 
         def _visible(self, a: int, q: str) -> bool:
             if q and q not in self.jeux[a]["nom"].lower() and q != str(a):
                 return False
-            f = self.filtre.get()
-            return (f == FILTRES[0] or (f == "Cochés" and a in self.coches) or (f == "En cours" and a in self.procs)
-                    or (f == "Avec objectif" and a in self.objectifs) or (f == "Remboursables" and self._remboursable(a))
-                    or (f == "Jamais lancés" and not self.jeux[a]["min"]) or (f == "Installés" and a in self.installes))
+            f = self._filtre_cle()
+            return (f == "tous" or (f == "coches" and a in self.coches) or (f == "encours" and a in self.procs)
+                    or (f == "objectif" and a in self.objectifs) or (f == "remb" and self._remboursable(a))
+                    or (f == "jamais" and not self.jeux[a]["min"]) or (f == "installes" and a in self.installes))
 
         def _remplir(self):
             q = self.recherche.get().strip().lower()
@@ -1480,7 +1828,7 @@ def interface(auto: bool, apres=None) -> None:
             for col, titre in (("#0", "Jeu"), ("temps", "Temps Steam"), ("objectif", "Objectif"),
                                ("farme", "Farmé ici")):
                 fleche = (" ▼" if inverse else " ▲") if (cle == "nom" and col == "#0") or cle == col else ""
-                self.arbre.heading(col, text=titre + fleche)
+                self.arbre.heading(col, text=T(titre) + fleche)
 
         def _maj_ligne(self, a: int):
             if a in self.jeux and self.arbre.exists(str(a)):
@@ -1527,38 +1875,62 @@ def interface(auto: bool, apres=None) -> None:
             m = self.menu
             m.delete(0, "end")
             if len(ids) > 1:
-                m.add_command(label=f"Ajouter les {len(ids)} au farm",
+                m.add_command(label=T("Ajouter les {n} au farm", n=len(ids)),
                               command=lambda: self._basculer_jeux([i for i in ids if i not in self.coches]))
-                m.add_command(label=f"Retirer les {len(ids)} du farm",
+                m.add_command(label=T("Retirer les {n} du farm", n=len(ids)),
                               command=lambda: self._basculer_jeux([i for i in ids if i in self.coches]))
             else:
-                m.add_command(label="Retirer du farm" if a in self.coches else "Ajouter au farm",
+                m.add_command(label=T("Retirer du farm") if a in self.coches else T("Ajouter au farm"),
                               command=lambda: self._basculer_jeux([a]))
-                m.add_command(label="Farmer uniquement celui-ci", command=lambda: self._uniquement(a))
-            m.add_command(label="Définir un objectif d'heures…", command=lambda: self._objectif_dialogue(ids))
+                m.add_command(label=T("Farmer uniquement celui-ci"), command=lambda: self._uniquement(a))
+            m.add_command(label=T("Définir un objectif d'heures…"), command=lambda: self._objectif_dialogue(ids))
+            m.add_command(label=T("Farmer encore quelques heures…"), command=lambda: self._encore_dialogue(ids))
             m.add_separator()
-            m.add_command(label="Ouvrir dans la bibliothèque Steam",
+            m.add_command(label=T("Ouvrir dans la bibliothèque Steam"),
                           command=lambda: self._ouvrir("steam://nav/games/details/{}", a))
-            m.add_command(label="Page du magasin",
+            m.add_command(label=T("Page du magasin"),
                           command=lambda: self._ouvrir("https://store.steampowered.com/app/{}", a))
-            m.add_command(label="Copier l'AppID", command=lambda: (self.r.clipboard_clear(),
-                                                                   self.r.clipboard_append(str(a))))
+            m.add_command(label=T("Copier l'AppID"), command=lambda: (self.r.clipboard_clear(),
+                                                                      self.r.clipboard_append(str(a))))
             if a in self.cfg.get("manuels", []):
                 m.add_separator()
-                m.add_command(label="Retirer de la liste", command=lambda: self._retirer_manuel(a))
+                m.add_command(label=T("Retirer de la liste"), command=lambda: self._retirer_manuel(a))
             m.tk_popup(e.x_root, e.y_root)
+
+        def _qui(self, ids) -> str:
+            return self.jeux[ids[0]]["nom"] if len(ids) == 1 else T("ces {n} jeux", n=len(ids))
 
         def _objectif_dialogue(self, ids):
             actuel = self.objectifs.get(ids[0], 0)
-            qui = self.jeux[ids[0]]["nom"] if len(ids) == 1 else f"ces {len(ids)} jeux"
-            choix, txt = self._dialogue("Objectif d'heures",
-                                        f"Temps de jeu Steam total à atteindre pour {qui}, en heures.\n"
-                                        "Quand il est atteint, le jeu sort du farm tout seul. 0 = pas d'objectif.",
-                                        [("Annuler", "TButton"), ("Valider", "Accent.TButton")],
+            choix, txt = self._dialogue(T("Objectif d'heures"),
+                                        T("Temps de jeu Steam total à atteindre pour {qui}, en heures.\n"
+                                          "Quand il est atteint, le jeu sort du farm tout seul. 0 = pas d'objectif.",
+                                          qui=self._qui(ids)),
+                                        [(T("Annuler"), "TButton"), (T("Valider"), "Accent.TButton")],
                                         saisie=court(actuel) if actuel else "")
             if choix == 1:
                 self._definir_objectif(ids, nombre(txt))
                 self._charger_objectif()
+
+        def _encore_dialogue(self, ids):
+            """Objectif relatif : « encore X heures à partir de maintenant »."""
+            ids = [a for a in ids if a in self.jeux]
+            if not ids:
+                return
+            choix, txt = self._dialogue(T("Farmer encore"),
+                                        T("Combien d'heures de plus pour {qui} ?\n"
+                                          "L'objectif devient le temps de jeu actuel plus ce nombre d'heures.",
+                                          qui=self._qui(ids)),
+                                        [(T("Annuler"), "TButton"), (T("Valider"), "Accent.TButton")], saisie="10")
+            plus = nombre(txt)
+            if choix != 1 or plus <= 0:
+                return
+            for a in ids:
+                self._definir_objectif([a], round((self._temps_steam(a) / 3600 + plus) * 60) / 60)
+            self._charger_objectif()
+            a_cocher = [a for a in ids if a not in self.coches]
+            if a_cocher:
+                self._basculer_jeux(a_cocher)
 
         def _ouvrir(self, modele: str, a: int | None = None):
             a = a or self.sel
@@ -1566,7 +1938,7 @@ def interface(auto: bool, apres=None) -> None:
                 try:
                     os.startfile(modele.format(a))
                 except OSError as e:
-                    self.etat.config(text=f"Impossible d'ouvrir : {e}")
+                    self.etat.config(text=T("Impossible d'ouvrir : {e}", e=e))
 
         # ── cocher / décocher ──
         def _basculer_selection(self):
@@ -1578,17 +1950,17 @@ def interface(auto: bool, apres=None) -> None:
             remb = [a for a in ids if self._a_confirmer(a)]
             if not remb:
                 return ids
-            lignes = "\n".join(f"•  {self.jeux[a]['nom']} : {self._texte_remb(a)}" for a in remb[:8])
+            lignes = "\n".join(T("•  {nom} : {r}", nom=self.jeux[a]["nom"], r=self._texte_remb(a)) for a in remb[:8])
             if len(remb) > 8:
-                lignes += f"\n•  … et {len(remb) - 8} autres"
-            un = len(remb) == 1
+                lignes += "\n" + T("•  … et {n} autres", n=len(remb) - 8)
+            modele = ("Ce jeu est encore remboursable sur Steam (moins de {j} jours après l'achat et moins de 2 h "
+                      "de jeu) :\n\n{lignes}\n\nAu-delà de 2 h de jeu, Steam ne rembourse plus.") if len(remb) == 1 \
+                else ("Ces jeux sont encore remboursables sur Steam (moins de {j} jours après l'achat et moins de "
+                      "2 h de jeu) :\n\n{lignes}\n\nAu-delà de 2 h de jeu, Steam ne rembourse plus.")
             choix, _ = self._dialogue(
-                "Jeux encore remboursables",
-                f"{'Ce jeu est encore remboursable' if un else 'Ces jeux sont encore remboursables'} sur Steam "
-                f"(moins de {REMB_JOURS} jours après l'achat et moins de 2 h de jeu) :\n\n{lignes}\n\n"
-                "Au-delà de 2 h de jeu, Steam ne rembourse plus.",
-                [("Ne pas farmer", "TButton"), ("Farmer jusqu'à 1 h 50", "TButton"),
-                 ("Farmer quand même", "Accent.TButton")])
+                T("Jeux encore remboursables"), T(modele, j=REMB_JOURS, lignes=lignes),
+                [(T("Ne pas farmer"), "TButton"), (T("Farmer jusqu'à 1 h 50"), "TButton"),
+                 (T("Farmer quand même"), "Accent.TButton")])
             if choix == 2:
                 self.remb_ok |= set(remb)
                 return ids
@@ -1606,9 +1978,11 @@ def interface(auto: bool, apres=None) -> None:
             fini = [a for a in ajout if self._objectif_atteint(a)]
             if fini:
                 ajout = [a for a in ajout if a not in fini]
-                self.etat.config(text=f"Objectif déjà atteint pour {self.jeux[fini[0]]['nom']}"
-                                      + (f" (et {len(fini) - 1} autre(s))" if len(fini) > 1 else "")
-                                      + " : augmente l'objectif ou mets-le à 0 pour le farmer.")
+                nom = self.jeux[fini[0]]["nom"]
+                self.etat.config(text=T("Objectif déjà atteint pour {nom} : augmente l'objectif ou mets-le à 0 "
+                                        "pour le farmer.", nom=nom) if len(fini) == 1 else
+                                 T("Objectif déjà atteint pour {nom} et {n} autre(s) : augmente l'objectif ou "
+                                   "mets-le à 0 pour les farmer.", nom=nom, n=len(fini) - 1))
             if demander and ajout:
                 ajout = self._confirmer_remboursables(ajout)
             for a in retrait:
@@ -1624,7 +1998,7 @@ def interface(auto: bool, apres=None) -> None:
             self._sauver()
             self._maj_sous_titre()
             self._maj_banniere_textes()
-            if self.filtre.get() in ("Cochés", "En cours"):
+            if self._filtre_cle() in ("coches", "encours"):
                 self._remplir()
 
         def _uniquement(self, a: int):
@@ -1639,45 +2013,46 @@ def interface(auto: bool, apres=None) -> None:
             m, sup = self.menu, self.menu_sup
             m.delete(0, "end")
             sup.delete(0, "end")
-            m.add_command(label="Enregistrer les jeux cochés comme groupe…", command=self._enregistrer_groupe,
+            m.add_command(label=T("Enregistrer les jeux cochés comme groupe…"), command=self._enregistrer_groupe,
                           state="normal" if self.coches else "disabled")
             if self.groupes:
                 m.add_separator()
                 for nom in sorted(self.groupes, key=str.lower):
-                    n = len(self.groupes[nom])
-                    m.add_command(label=f"{nom}   ({n} jeu{'x' if n > 1 else ''})",
+                    m.add_command(label=pluriel(len(self.groupes[nom]), "{nom}   ({n} jeu)", "{nom}   ({n} jeux)",
+                                                nom=nom),
                                   command=lambda nom=nom: self._appliquer_groupe(nom))
                     sup.add_command(label=nom, command=lambda nom=nom: self._supprimer_groupe(nom))
                 m.add_separator()
-                m.add_cascade(label="Supprimer un groupe", menu=sup)
+                m.add_cascade(label=T("Supprimer un groupe"), menu=sup)
             b = self.b_groupes
             m.tk_popup(b.winfo_rootx(), b.winfo_rooty() + b.winfo_height())
 
         def _enregistrer_groupe(self):
             n = len(self.coches)
-            choix, nom = self._dialogue("Nouveau groupe",
-                                        f"Nom du groupe ({n} jeu{'x' if n > 1 else ''} coché{'s' if n > 1 else ''}) :",
-                                        [("Annuler", "TButton"), ("Enregistrer", "Accent.TButton")], saisie="")
+            choix, nom = self._dialogue(T("Nouveau groupe"),
+                                        pluriel(n, "Nom du groupe ({n} jeu coché) :", "Nom du groupe ({n} jeux cochés) :"),
+                                        [(T("Annuler"), "TButton"), (T("Enregistrer"), "Accent.TButton")], saisie="")
             if choix == 1 and nom:
                 self.groupes[nom] = list(self.coches)
                 self._sauver()
-                self.etat.config(text=f"Groupe « {nom} » enregistré. Menu Groupes pour le recocher en un clic.")
+                self.etat.config(text=T("Groupe « {nom} » enregistré. Menu Groupes pour le recocher en un clic.",
+                                        nom=nom))
 
         def _appliquer_groupe(self, nom: str):
             cible = [a for a in self.groupes.get(nom, []) if a in self.jeux]
             self._basculer_jeux([a for a in self.coches if a not in cible] + [a for a in cible if a not in self.coches])
-            self.etat.config(text=f"Groupe « {nom} » : {len(cible)} jeu{'x' if len(cible) > 1 else ''} coché"
-                                  f"{'s' if len(cible) > 1 else ''}.")
+            self.etat.config(text=pluriel(len(cible), "Groupe « {nom} » : {n} jeu coché.",
+                                          "Groupe « {nom} » : {n} jeux cochés.", nom=nom))
 
         def _supprimer_groupe(self, nom: str):
             self.groupes.pop(nom, None)
             self._sauver()
-            self.etat.config(text=f"Groupe « {nom} » supprimé.")
+            self.etat.config(text=T("Groupe « {nom} » supprimé.", nom=nom))
 
         def _ajouter(self):
             t = self.ajout.get().strip()
             if not t.isdigit():
-                self.etat.config(text="Un AppID est un nombre : il est dans l'adresse de la page Steam du jeu.")
+                self.etat.config(text=T("Un AppID est un nombre : il est dans l'adresse de la page Steam du jeu."))
                 return
             a = int(t)
             self.cfg.setdefault("manuels", [])
@@ -1693,7 +2068,7 @@ def interface(auto: bool, apres=None) -> None:
             if self.arbre.exists(str(a)):
                 self.arbre.see(str(a))
                 self.arbre.selection_set(str(a))
-            self.etat.config(text=f"{self.jeux[a]['nom']} ajouté au farm.")
+            self.etat.config(text=T("{nom} ajouté au farm.", nom=self.jeux[a]["nom"]))
 
         def _retirer_manuel(self, a: int):
             if a in self.coches:
@@ -1712,7 +2087,7 @@ def interface(auto: bool, apres=None) -> None:
                     and not self._a_confirmer(a)]
 
         def _remplir_creneaux(self):
-            if not self.actif or self.pause_steam:
+            if not self.actif or self.pause:
                 return
             for a in self._candidats():
                 if len(self.procs) >= MAX_SIMULTANES:
@@ -1737,6 +2112,7 @@ def interface(auto: bool, apres=None) -> None:
                 return
             if compter:
                 self.farme[a] = self.farme.get(a, 0) + time.time() - p[1]
+            self.arretes[a] = time.time()
             p[0].terminate()
             try:
                 p[0].wait(timeout=3)
@@ -1746,16 +2122,17 @@ def interface(auto: bool, apres=None) -> None:
 
         def _marche_arret(self, interactif: bool = True):
             if self.actif:
-                self._tout_arreter("Farm arrêté.")
+                self._tout_arreter(T("Farm arrêté."))
                 return
             a_lancer = [a for a in self.coches if a in self.jeux]
             if not a_lancer:
-                self.etat.config(text="Coche d'abord au moins un jeu (clic sur la case à gauche de son logo).")
+                self.etat.config(text=T("Coche d'abord au moins un jeu (clic sur la case à gauche de son logo)."))
                 return
             if not DLL.exists():
                 if interactif:
-                    messagebox.showerror("Farm d'heures Steam", "steam_api64.dll introuvable.\n"
-                                         "Installe n'importe quel jeu Steam puis clique Recharger.")
+                    messagebox.showerror(T("Farm d'heures Steam"),
+                                         T("steam_api64.dll introuvable.\n"
+                                           "Installe n'importe quel jeu Steam puis clique Recharger."))
                 return
             if interactif:
                 garder = set(self._confirmer_remboursables(a_lancer))
@@ -1767,11 +2144,15 @@ def interface(auto: bool, apres=None) -> None:
             self.total_depart = sum(self._total(a) for a in self.jeux)
             self.echecs.clear()
             self.essais.clear()
-            self.pause_steam = None if steam_pret() else now
+            self.reprise_depuis, self.jeu_reel, self.derniere_verif_jeu = None, None, 0.0
+            self.pause = self._raison_pause(now, False)
             if self.eveille.get():
                 garder_eveille(True)
+            if self.invisible.get():
+                self._passer_invisible()
             self._remplir_creneaux()
-            self.bouton.config(text="■  Arrêter le farm", style="Arret.TButton")
+            self.bouton.config(text=T("■  Arrêter le farm"), style="Arret.TButton")
+            self._maj_menu_tray()
             self._remplir()
             self._maj_sous_titre()
             self._maj_banniere_textes()
@@ -1780,10 +2161,12 @@ def interface(auto: bool, apres=None) -> None:
             for a in list(self.procs):
                 self._arreter(a)
             self.actif = False
-            self.pause_steam = self.steam_revenu = None
+            self.pause = self.reprise_depuis = self.jeu_reel = None
             self.essais.clear()
             garder_eveille(False)
-            self.bouton.config(text="▶  Démarrer le farm", style="Accent.TButton")
+            self._restaurer_statut()
+            self.bouton.config(text=T("▶  Démarrer le farm"), style="Accent.TButton")
+            self._maj_menu_tray()
             if message:
                 self.etat.config(text=message)
             self._sauver()
@@ -1813,6 +2196,7 @@ def interface(auto: bool, apres=None) -> None:
                 if code is None:
                     continue
                 del self.procs[a]
+                self.arretes[a] = now
                 if code != 4:
                     self.farme[a] = self.farme.get(a, 0) + now - t0
                 else:
@@ -1827,14 +2211,14 @@ def interface(auto: bool, apres=None) -> None:
                         self.essais[a] = (n, now + DELAI_ESSAI)
                     else:
                         self.essais.pop(a, None)
-                        self.echecs[a] = "refusé par Steam"
+                        self.echecs[a] = "refus"
                 else:
                     self.essais.pop(a, None)
-                    self.echecs[a] = f"arrêté ({code})"
+                    self.echecs[a] = code
                 self._maj_ligne(a)
             if self.actif:
-                self._surveiller_steam(now, steam_ferme)
-                if not self.pause_steam:
+                self._surveiller(now, steam_ferme)
+                if not self.pause:
                     self._verifier_objectifs()
                     self._rotation(now)
                     self._remplir_creneaux()
@@ -1850,31 +2234,61 @@ def interface(auto: bool, apres=None) -> None:
             else:
                 if not self.etat.cget("text"):
                     total = sum(self._total(a) for a in self.farme)
-                    self.etat.config(text=f"Total farmé avec l'appli : {heures(total / 60, '0 h 00')}")
-                self._titre_tray("Farm d'heures Steam")
+                    self.etat.config(text=T("Total farmé avec l'appli : {h}", h=heures(total / 60, None)))
+                self._titre_tray(T("Farm d'heures Steam"))
+                # statut resté invisible (Steam fermé à l'arrêt, PC éteint pendant le farm) : remis dès que possible
+                if self.statut_avant is not None and not self.auto:
+                    self._restaurer_statut()
             for a in self.procs:
                 self._maj_ligne(a)
             self._maj_banniere_textes()
             self._demarrage_auto()
 
-        def _surveiller_steam(self, now: float, steam_ferme: bool):
-            """Met le farm en pause si Steam se ferme, et le relance tout seul quand Steam revient."""
+        def _raison_pause(self, now: float, steam_ferme: bool) -> str | None:
+            """Pourquoi le farm doit rester en pause en ce moment (ou None)."""
             if steam_ferme or not steam_pret():
-                self.steam_revenu = None
-                if not self.pause_steam:
-                    self.pause_steam = now
+                return "steam"
+            if self.pause_jeu.get():
+                if now - self.derniere_verif_jeu >= VERIF_JEU:
+                    self.derniere_verif_jeu = now
+                    self.arretes = {a: t for a, t in self.arretes.items() if now - t < GRACE_ARRET}
+                    self.jeu_reel = jeu_lance(set(self.procs) | set(self.arretes) | {APP_TEST})
+                if self.jeu_reel:
+                    return "jeu"
+            else:
+                self.jeu_reel = None
+            if self.si_inactif.get() and inactivite() < nombre(self.inactif_min.get()) * 60:
+                return "pc"
+            return None
+
+        def _surveiller(self, now: float, steam_ferme: bool):
+            """Met le farm en pause (Steam fermé, vrai jeu lancé, PC utilisé) et le relance tout seul ensuite."""
+            raison = self._raison_pause(now, steam_ferme)
+            if raison:
+                self.reprise_depuis = None
+                if raison != self.pause:
+                    self.pause = raison
                     for a in list(self.procs):
                         self._arreter(a)
-                    self._notifier("Steam s'est fermé : le farm est en pause et reprendra tout seul.")
+                    if raison == "steam":
+                        self._notifier(T("Steam s'est fermé : le farm est en pause et reprendra tout seul."))
+                    elif raison == "jeu":
+                        self._notifier(T("{nom} est lancé : le farm se met en pause jusqu'à ce que tu le quittes.",
+                                         nom=self.jeu_reel[1]))
                     self._remplir()
-            elif self.pause_steam:
-                self.steam_revenu = self.steam_revenu or now
-                if now - self.steam_revenu >= PAUSE_STEAM:
-                    self.pause_steam = self.steam_revenu = None
-                    self.essais.clear()
-                    self.echecs.clear()
+            elif self.pause:
+                self.reprise_depuis = self.reprise_depuis or now
+                if now - self.reprise_depuis >= (0 if self.pause == "pc" else PAUSE_STEAM):
+                    ancienne, self.pause, self.reprise_depuis = self.pause, None, None
+                    if ancienne == "steam":
+                        self.essais.clear()
+                        self.echecs.clear()
+                        self._appliquer_statut()     # pas possible tant que Steam était fermé
                     self._remplir_creneaux()
-                    self._notifier("Steam est revenu : le farm a repris.")
+                    if ancienne == "steam":
+                        self._notifier(T("Steam est revenu : le farm a repris."))
+                    elif ancienne == "jeu":
+                        self._notifier(T("Jeu quitté : le farm a repris."))
                     self._remplir()
 
         def _verifier_objectifs(self):
@@ -1887,11 +2301,11 @@ def interface(auto: bool, apres=None) -> None:
                     self._maj_ligne(a)
                     self._maj_sous_titre()
                     if tournait:
-                        self._notifier(f"Objectif atteint : {self.jeux[a]['nom']} "
-                                       f"({objectif_txt(self.objectifs[a])}). Il sort du farm.")
+                        self._notifier(T("Objectif atteint : {nom} ({o}). Il sort du farm.",
+                                         nom=self.jeux[a]["nom"], o=objectif_txt(self.objectifs[a])))
                     self._sauver()
                     if not any(b in self.jeux for b in self.coches):
-                        self._tout_arreter("Tous les jeux cochés ont atteint leur objectif : farm terminé.")
+                        self._tout_arreter(T("Tous les jeux cochés ont atteint leur objectif : farm terminé."))
                         return
 
         def _rotation(self, now: float):
@@ -1905,7 +2319,7 @@ def interface(auto: bool, apres=None) -> None:
                 self._arreter(a)
                 self.coches.pop(a, None)
                 self.coches[a] = None
-            journal("rotation : groupe de jeux suivant")
+            journal(T("rotation : groupe de jeux suivant"))
             self._remplir_creneaux()
             self._maj_lignes_cochees()
 
@@ -1914,31 +2328,42 @@ def interface(auto: bool, apres=None) -> None:
             ecoule = now - self.debut
             gagne = sum(self._total(a) for a in self.jeux) - self.total_depart
             if limite > 0 and ecoule >= limite:
-                self._tout_arreter(f"Terminé : {hms(ecoule)} de farm, {heures(gagne / 60, '0 h 00')} gagnées au total.")
-                self._notifier("Arrêt automatique : la durée de farm choisie est écoulée.")
+                self._tout_arreter(T("Terminé : {d} de farm, {h} gagnées au total.",
+                                     d=hms(ecoule), h=heures(gagne / 60, None)))
+                self._notifier(T("Arrêt automatique : la durée de farm choisie est écoulée."))
                 return
             n = len(self.procs)
-            if self.pause_steam:
-                txt = "⏸  Steam est fermé : le farm reprendra tout seul dès que Steam sera de retour"
-                if self.steam_revenu:
-                    txt = f"↻  Steam est revenu, reprise dans {max(0, int(PAUSE_STEAM - (now - self.steam_revenu)))} s"
+            if self.pause:
+                txt = self._texte_pause()
+                if self.reprise_depuis and self.pause != "pc":
+                    txt = T("↻  Reprise du farm dans {s} s",
+                            s=max(0, int(PAUSE_STEAM - (now - self.reprise_depuis))))
             else:
                 attente = len([a for a in self.coches if a in self.jeux and a not in self.procs])
-                txt = f"▶  {n} jeu{'x' if n > 1 else ''} en cours"
+                txt = pluriel(n, "▶  {n} jeu en cours", "▶  {n} jeux en cours")
                 if attente:
-                    txt += f" · {attente} en attente"
-                txt += f"  ·  {hms(ecoule)}  ·  +{heures(gagne / 60, '0 h 00')} gagnées"
+                    txt += T(" · {n} en attente", n=attente)
+                txt += T("  ·  {d}  ·  +{h} gagnées", d=hms(ecoule), h=heures(gagne / 60, None))
                 if limite > 0:
-                    txt += f"  ·  arrêt dans {hms(limite - ecoule)}"
+                    txt += T("  ·  arrêt dans {d}", d=hms(limite - ecoule))
                 if self.echecs:
-                    txt += f"  ·  {len(self.echecs)} refusé(s)"
+                    txt += T("  ·  {n} refusé(s)", n=len(self.echecs))
             self.etat.config(text=txt)
-            self._titre_tray(f"Farm d'heures Steam — {n} jeu{'x' if n > 1 else ''} en cours"
-                             if not self.pause_steam else "Farm d'heures Steam — en pause (Steam fermé)")
+            self._titre_tray(pluriel(n, "Farm d'heures Steam — {n} jeu en cours",
+                                     "Farm d'heures Steam — {n} jeux en cours")
+                             if not self.pause else T("Farm d'heures Steam — en pause"))
 
         def _titre_tray(self, titre: str):
             if self.tray and self.tray.title != titre:
                 self.tray.title = titre
+
+        def _maj_menu_tray(self):
+            """pystray ne recalcule le menu (Démarrer / Arrêter) que sur demande."""
+            if self.tray:
+                try:
+                    self.tray.update_menu()
+                except Exception:
+                    pass
 
         def _demarrage_auto(self):
             """Mode --auto (démarrage de Windows) : attend que Steam soit connecté puis lance le farm."""
@@ -1952,6 +2377,8 @@ def interface(auto: bool, apres=None) -> None:
                 self.auto = False
                 if any(a in self.jeux for a in self.coches):
                     self._marche_arret(interactif=False)
+                else:
+                    self._restaurer_statut()
 
         def _sauver(self):
             self._derniere_sauvegarde = time.time()
@@ -1959,12 +2386,17 @@ def interface(auto: bool, apres=None) -> None:
             self.historique = {j: v for j, v in self.historique.items() if j >= limite}
             self.cfg.update(
                 coches=list(self.coches), heures=self.duree.get(), rotation=self.rotation.get(),
-                eveille=self.eveille.get(),
+                eveille=self.eveille.get(), invisible=self.invisible.get(), pause_jeu=self.pause_jeu.get(),
+                si_inactif=self.si_inactif.get(), inactif_min=self.inactif_min.get(),
                 farme={str(a): round(self._total(a)) for a in set(self.farme) | set(self.procs)},
                 objectifs={str(a): h for a, h in self.objectifs.items()}, atteints=sorted(self.atteints),
                 achats={str(a): t for a, t in self.achats.items()}, famille=sorted(self.famille),
                 remb_ok=sorted(self.remb_ok), groupes=self.groupes,
                 historique={j: {a: round(s) for a, s in v.items()} for j, v in self.historique.items()})
+            if self.statut_avant is None:
+                self.cfg.pop("statut_avant", None)
+            else:
+                self.cfg["statut_avant"] = self.statut_avant
             try:
                 CONFIG.write_text(json.dumps(self.cfg), encoding="utf-8")
             except OSError:
@@ -1981,7 +2413,240 @@ def interface(auto: bool, apres=None) -> None:
     r.mainloop()
 
 
+# ───────────────────────── Traduction anglaise ─────────────────────────
+# Clé = texte français tel qu'il est écrit dans le code ; les {champs} doivent être les mêmes.
+
+EN = {
+    # titres, boutons, colonnes
+    "Farm d'heures Steam": "Steam Hours Farm",
+    "↻  Recharger": "↻  Reload",
+    "Statistiques": "Statistics",
+    "Options": "Options",
+    "Objectif": "Goal",
+    "h de jeu au total": "h of total playtime",
+    "＋ X h…": "＋ X h…",
+    "＋  Ajouter au farm": "＋  Add to farm",
+    "Ouvrir dans Steam": "Open in Steam",
+    "Rechercher": "Search",
+    "Groupes  ▾": "Groups  ▾",
+    "Tout décocher": "Uncheck all",
+    "▶  Démarrer le farm": "▶  Start farming",
+    "■  Arrêter le farm": "■  Stop farming",
+    "Jeu": "Game",
+    "Temps Steam": "Steam time",
+    "Farmé ici": "Farmed here",
+    "Tous les jeux": "All games",
+    "Cochés": "Checked",
+    "En cours": "Running",
+    "Avec objectif": "With a goal",
+    "Remboursables": "Refundable",
+    "Jamais lancés": "Never played",
+    "Installés": "Installed",
+    # sous-titre
+    "{n} jeu": "{n} game",
+    "{n} jeux": "{n} games",
+    "{n} coché": "{n} checked",
+    "{n} cochés": "{n} checked",
+    "lecture de ta bibliothèque…": "reading your library…",
+    "Steam fermé ? liste du dernier lancement": "Steam closed? list from the last launch",
+    "Steam fermé ? liste non vérifiée": "Steam closed? list not verified",
+    "steam_api64.dll introuvable : le farm ne pourra pas démarrer": "steam_api64.dll not found: farming can't start",
+    "impossible de lire Steam : {e}": "can't read Steam: {e}",
+    # options
+    "Farm": "Farming",
+    "Arrêter le farm automatiquement après": "Stop farming automatically after",
+    "h  (0 = jamais)": "h  (0 = never)",
+    "Rotation : changer de groupe de jeux toutes les": "Rotation: switch to the next group of games every",
+    "Steam accepte {n} jeux à la fois. Si tu en coches plus, l'appli les fait tourner par groupes et passe au "
+    "groupe suivant à chaque rotation.":
+        "Steam accepts {n} games at once. If you check more, the app runs them in groups and moves to the next "
+        "group at each rotation.",
+    "Garder le PC éveillé pendant le farm": "Keep the PC awake while farming",
+    "Quand farmer": "When to farm",
+    "Farmer seulement quand je n'utilise pas le PC, après": "Only farm when I'm not using the PC, after",
+    "min sans activité": "min of inactivity",
+    "Mettre le farm en pause quand je lance un vrai jeu": "Pause farming when I launch a real game",
+    "Passer en invisible sur Steam pendant le farm": "Go invisible on Steam while farming",
+    "En invisible, tes amis ne te voient plus « En jeu ». Ton statut d'avant revient quand le farm s'arrête.":
+        "While invisible, your friends no longer see you \"In game\". Your previous status comes back when "
+        "farming stops.",
+    "Lancer avec Windows": "Start with Windows",
+    "Au démarrage du PC, l'appli s'ouvre cachée dans la zone de notification, attend que Steam soit connecté, "
+    "puis farme tes jeux cochés.":
+        "When the PC starts, the app opens hidden in the system tray, waits for Steam to log in, then farms "
+        "your checked games.",
+    "Langue": "Language",
+    "Ajouter un jeu par son AppID": "Add a game by its AppID",
+    "Ajouter": "Add",
+    "Pour un jeu absent de la liste. L'AppID est le nombre dans l'adresse de sa page Steam "
+    "(store.steampowered.com/app/730 → 730).":
+        "For a game missing from the list. The AppID is the number in its Steam store page address "
+        "(store.steampowered.com/app/730 → 730).",
+    "Version {v}": "Version {v}",
+    "Fermer": "Close",
+    "Page du projet": "Project page",
+    # statistiques
+    "Aujourd'hui": "Today",
+    "7 derniers jours": "Last 7 days",
+    "Total farmé avec l'appli": "Total farmed with the app",
+    "Heures farmées par jour · 30 derniers jours": "Hours farmed per day · last 30 days",
+    "Jeux les plus farmés": "Most farmed games",
+    "Pas encore d'heures farmées. Lance le farm pour voir tes stats ici.":
+        "No hours farmed yet. Start farming to see your stats here.",
+    "auj.": "today",
+    "{j} {d} : {h}": "{j} {d}: {h}",
+    " · {n} jeu": " · {n} game",
+    " · {n} jeux": " · {n} games",
+    "Aucun jeu farmé pour l'instant.": "No game farmed yet.",
+    # zone de notification
+    "Ouvrir": "Open",
+    "Arrêter le farm": "Stop farming",
+    "Démarrer le farm": "Start farming",
+    "Quitter": "Quit",
+    "Le farm continue. Clic sur l'icône pour rouvrir, clic droit pour quitter.":
+        "Still farming. Click the icon to reopen, right-click to quit.",
+    "Au démarrage de Windows, l'appli s'ouvre cachée et farme les jeux cochés.":
+        "At Windows startup, the app opens hidden and farms your checked games.",
+    "Ne se lance plus avec Windows.": "No longer starts with Windows.",
+    "Impossible de régler le démarrage : {e}": "Couldn't change the startup setting: {e}",
+    "Farm d'heures Steam — {n} jeu en cours": "Steam Hours Farm — {n} game running",
+    "Farm d'heures Steam — {n} jeux en cours": "Steam Hours Farm — {n} games running",
+    "Farm d'heures Steam — en pause": "Steam Hours Farm — paused",
+    # bannière
+    "Coche des jeux dans la liste, puis Démarrer le farm.": "Check games in the list, then click Start farming.",
+    "Temps Steam  {t}      Farmé ici  {f}      AppID  {a}": "Steam time  {t}      Farmed here  {f}      AppID  {a}",
+    "▶  En cours depuis {d}": "▶  Running for {d}",
+    "  ·  ⚠ remboursable : {r}": "  ·  ⚠ refundable: {r}",
+    "✗  {e} (voir journal.txt)": "✗  {e} (see journal.txt)",
+    "↻  Steam a refusé, nouvel essai dans quelques secondes": "↻  Steam refused, retrying in a few seconds",
+    "✓  Objectif atteint ({o})": "✓  Goal reached ({o})",
+    "⚠  Encore remboursable : {r}": "⚠  Still refundable: {r}",
+    "✓  Dans le farm — en attente d'une place (32 jeux max)": "✓  In the farm — waiting for a free slot (32 games max)",
+    "✓  Dans le farm — démarre avec le bouton en bas": "✓  In the farm — starts with the button below",
+    "Pas dans le farm": "Not in the farm",
+    "Retirer du farm": "Remove from farm",
+    "{t} sur {o}": "{t} of {o}",
+    "fin prévue {m}": "ETA {m}",
+    "aujourd'hui à {h}": "today at {h}",
+    "demain à {h}": "tomorrow at {h}",
+    "reste {r}": "{r} left",
+    "acheté il y a {n} jour, encore {r} avant la limite de 2 h": "bought {n} day ago, {r} left before the 2-hour limit",
+    "acheté il y a {n} jours, encore {r} avant la limite de 2 h":
+        "bought {n} days ago, {r} left before the 2-hour limit",
+    "refusé par Steam": "refused by Steam",
+    "arrêté (code {c})": "stopped (code {c})",
+    "⏸  Steam est fermé : le farm reprendra tout seul dès que Steam sera de retour":
+        "⏸  Steam is closed: farming will resume by itself once Steam is back",
+    "⏸  En pause pendant que tu joues à {nom}": "⏸  Paused while you play {nom}",
+    "⏸  En pause : tu utilises le PC. Le farm reprend après {n} min sans activité":
+        "⏸  Paused: you're using the PC. Farming resumes after {n} min of inactivity",
+    # colonnes
+    "⏸  pause": "⏸  paused",
+    "✗  refusé": "✗  refused",
+    "↻  nouvel essai": "↻  retrying",
+    "⚠  à confirmer": "⚠  to confirm",
+    "en attente": "waiting",
+    "{p}  de {o}": "{p}  of {o}",
+    # menu clic droit et dialogues
+    "Ajouter les {n} au farm": "Add these {n} to the farm",
+    "Retirer les {n} du farm": "Remove these {n} from the farm",
+    "Ajouter au farm": "Add to farm",
+    "Farmer uniquement celui-ci": "Farm only this one",
+    "Définir un objectif d'heures…": "Set an hours goal…",
+    "Farmer encore quelques heures…": "Farm a few more hours…",
+    "Ouvrir dans la bibliothèque Steam": "Open in the Steam library",
+    "Page du magasin": "Store page",
+    "Copier l'AppID": "Copy AppID",
+    "Retirer de la liste": "Remove from list",
+    "ces {n} jeux": "these {n} games",
+    "Objectif d'heures": "Hours goal",
+    "Temps de jeu Steam total à atteindre pour {qui}, en heures.\nQuand il est atteint, le jeu sort du farm tout "
+    "seul. 0 = pas d'objectif.":
+        "Total Steam playtime to reach for {qui}, in hours.\nOnce it's reached, the game leaves the farm by "
+        "itself. 0 = no goal.",
+    "Annuler": "Cancel",
+    "Valider": "OK",
+    "Farmer encore": "Farm more hours",
+    "Combien d'heures de plus pour {qui} ?\nL'objectif devient le temps de jeu actuel plus ce nombre d'heures.":
+        "How many more hours for {qui}?\nThe goal becomes the current playtime plus this number of hours.",
+    "Impossible d'ouvrir : {e}": "Couldn't open: {e}",
+    "•  {nom} : {r}": "•  {nom}: {r}",
+    "•  … et {n} autres": "•  … and {n} more",
+    "Ce jeu est encore remboursable sur Steam (moins de {j} jours après l'achat et moins de 2 h de jeu) :\n\n"
+    "{lignes}\n\nAu-delà de 2 h de jeu, Steam ne rembourse plus.":
+        "This game can still be refunded on Steam (less than {j} days since purchase and less than 2 hours "
+        "played):\n\n{lignes}\n\nOnce it has more than 2 hours of playtime, Steam won't refund it.",
+    "Ces jeux sont encore remboursables sur Steam (moins de {j} jours après l'achat et moins de 2 h de jeu) :\n\n"
+    "{lignes}\n\nAu-delà de 2 h de jeu, Steam ne rembourse plus.":
+        "These games can still be refunded on Steam (less than {j} days since purchase and less than 2 hours "
+        "played):\n\n{lignes}\n\nOnce a game has more than 2 hours of playtime, Steam won't refund it.",
+    "Jeux encore remboursables": "Games still refundable",
+    "Ne pas farmer": "Don't farm",
+    "Farmer jusqu'à 1 h 50": "Farm up to 1h 50m",
+    "Farmer quand même": "Farm anyway",
+    "Objectif déjà atteint pour {nom} : augmente l'objectif ou mets-le à 0 pour le farmer.":
+        "Goal already reached for {nom}: raise the goal or set it to 0 to farm it.",
+    "Objectif déjà atteint pour {nom} et {n} autre(s) : augmente l'objectif ou mets-le à 0 pour les farmer.":
+        "Goal already reached for {nom} and {n} other(s): raise the goal or set it to 0 to farm them.",
+    # groupes
+    "Enregistrer les jeux cochés comme groupe…": "Save checked games as a group…",
+    "{nom}   ({n} jeu)": "{nom}   ({n} game)",
+    "{nom}   ({n} jeux)": "{nom}   ({n} games)",
+    "Supprimer un groupe": "Delete a group",
+    "Nouveau groupe": "New group",
+    "Nom du groupe ({n} jeu coché) :": "Group name ({n} checked game):",
+    "Nom du groupe ({n} jeux cochés) :": "Group name ({n} checked games):",
+    "Enregistrer": "Save",
+    "Groupe « {nom} » enregistré. Menu Groupes pour le recocher en un clic.":
+        "Group \"{nom}\" saved. Use the Groups menu to check it again in one click.",
+    "Groupe « {nom} » : {n} jeu coché.": "Group \"{nom}\": {n} game checked.",
+    "Groupe « {nom} » : {n} jeux cochés.": "Group \"{nom}\": {n} games checked.",
+    "Groupe « {nom} » supprimé.": "Group \"{nom}\" deleted.",
+    "Un AppID est un nombre : il est dans l'adresse de la page Steam du jeu.":
+        "An AppID is a number: you'll find it in the address of the game's Steam store page.",
+    "{nom} ajouté au farm.": "{nom} added to the farm.",
+    # farm
+    "Farm arrêté.": "Farming stopped.",
+    "Coche d'abord au moins un jeu (clic sur la case à gauche de son logo).":
+        "First check at least one game (click the box left of its logo).",
+    "steam_api64.dll introuvable.\nInstalle n'importe quel jeu Steam puis clique Recharger.":
+        "steam_api64.dll not found.\nInstall any Steam game, then click Reload.",
+    "Total farmé avec l'appli : {h}": "Total farmed with the app: {h}",
+    "Steam s'est fermé : le farm est en pause et reprendra tout seul.":
+        "Steam closed: farming is paused and will resume by itself.",
+    "{nom} est lancé : le farm se met en pause jusqu'à ce que tu le quittes.":
+        "{nom} is running: farming is paused until you quit it.",
+    "Steam est revenu : le farm a repris.": "Steam is back: farming resumed.",
+    "Jeu quitté : le farm a repris.": "Game closed: farming resumed.",
+    "Objectif atteint : {nom} ({o}). Il sort du farm.": "Goal reached: {nom} ({o}). It leaves the farm.",
+    "Tous les jeux cochés ont atteint leur objectif : farm terminé.":
+        "All checked games reached their goal: farming finished.",
+    "Terminé : {d} de farm, {h} gagnées au total.": "Done: {d} of farming, {h} gained in total.",
+    "Arrêt automatique : la durée de farm choisie est écoulée.": "Automatic stop: the farming time you set is over.",
+    "↻  Reprise du farm dans {s} s": "↻  Farming resumes in {s} s",
+    "▶  {n} jeu en cours": "▶  {n} game running",
+    "▶  {n} jeux en cours": "▶  {n} games running",
+    " · {n} en attente": " · {n} waiting",
+    "  ·  {d}  ·  +{h} gagnées": "  ·  {d}  ·  +{h} gained",
+    "  ·  arrêt dans {d}": "  ·  stops in {d}",
+    "  ·  {n} refusé(s)": "  ·  {n} refused",
+    # journal.txt
+    "DLL copiée depuis {f}": "DLL copied from {f}",
+    "SteamAPI_Init a échoué": "SteamAPI_Init failed",
+    "[{a}] Steam a refusé : {m}": "[{a}] Steam refused: {m}",
+    "[{a}] Steam s'est fermé": "[{a}] Steam closed",
+    "vérification des jeux possédés impossible : {e}": "couldn't check owned games: {e}",
+    "vérification des jeux possédés : Steam a refusé ({e})": "checking owned games: Steam refused ({e})",
+    "appinfo.vdf : format inconnu {m}": "appinfo.vdf: unknown format {m}",
+    "changement de statut Steam impossible : {e}": "couldn't change Steam status: {e}",
+    "icône de notification impossible : {e}": "couldn't create the tray icon: {e}",
+    "chargement : {e}": "loading: {e}",
+    "rotation : groupe de jeux suivant": "rotation: next group of games",
+}
+
+
 def main():
+    charger_langue()
     args = sys.argv[1:]
     if args[:1] == ["--farm"]:
         sys.exit(mode_farm(int(args[1]), int(args[2])))

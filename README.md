@@ -1,17 +1,20 @@
 # Steam Hours Farm
 
-A small Windows app that idles your Steam games: Steam thinks the game is running and counts the playtime (trading card drops included), but the game itself never starts. The interface is in French.
+A small Windows app that idles your Steam games: Steam thinks the game is running and counts the playtime (trading card drops included), but the game itself never starts. The interface is in English or French: you pick the language on first launch and can change it later in Options.
 
-![Main window (demo data)](docs/capture.png)
+![Main window (demo data)](docs/capture-en.png)
 
 ## Features
 
 - Lists the games you own. The app reads Steam's local files and asks the Steam client which games you own.
 - Shows game icons and banner art from Steam's local cache. Nothing is downloaded.
 - Idles up to 32 games at once, the most Steam allows.
-- **Hours goal per game:** set a total playtime (say 500 h) and the game leaves the farm by itself once Steam reaches it. When every checked game is done, the farm stops.
+- **Hours goal per game:** set a total playtime (say 500 h) and the game leaves the farm by itself once Steam reaches it. The banner shows when it should get there. **+ X h** sets the goal to the current playtime plus a few hours. When every checked game is done, the farm stops.
 - **More than 32 games:** extra games wait in a queue. Every few hours (2 by default) the app swaps the running group for the next one.
+- **Pauses while you play:** when you launch a real game, the farm pauses and starts again once you quit it.
 - **Steam restarts:** if Steam closes, crashes or updates, the farm pauses and starts again by itself once Steam is back.
+- **Only when you're away** (optional): idle only after a few minutes without keyboard or mouse input.
+- **Invisible mode** (optional): go invisible on Steam while idling, so friends don't see you "In game". Your previous status comes back when the farm stops.
 - **Refund warning:** a game bought less than 14 days ago with less than 2 hours played triggers a prompt. You can skip it, idle it up to 1 h 50, or idle it anyway.
 - **Statistics:** hours idled per day over the last 30 days, and your most idled games.
 - **Groups:** save the games you checked under a name and check them all again in one click.
@@ -20,7 +23,7 @@ A small Windows app that idles your Steam games: Steam thinks the game is runnin
 - Can start with Windows: it opens hidden and starts idling the games you checked once Steam is logged in.
 - Search, filters (checked, running, with a goal, refundable, never played, installed) and a right-click menu.
 
-![Statistics window (demo data)](docs/stats.png)
+![Statistics window (demo data)](docs/stats-en.png)
 
 ## Install
 
@@ -61,21 +64,26 @@ Each idled game is a tiny background process. It loads Valve's `steam_api64.dll`
 
 The refund warning uses the purchase date that the Steam client reports for each game. Free games and games shared through Steam Family are left out.
 
+A real game is spotted through the "running" flag Steam keeps for each game in the Windows registry. Invisible mode uses Steam's own `steam://friends/status/invisible` link, and reads your previous status from Steam's local settings.
+
 ## Good to know
 
 - **Steam counts real time.** One hour of idling adds one hour to each idled game. Nothing can speed that up, but you can idle several games at once.
 - **Refunds:** Steam won't refund a game once it has more than 2 hours of playtime. The app warns you, but the choice is yours.
-- Your friends will see you as "In game".
+- Your friends will see you as "In game", unless you turn on invisible mode in Options.
+- Games idled by another tool (ArchiSteamFarm, for example) look like real games to the app, so it pauses. If you use both, turn off "Pause farming when I launch a real game" in Options.
 - Each idled game uses about 55 MB of RAM, mostly Steam's own client library.
 - Many players idle games with tools like Idle Master or ArchiSteamFarm, but Valve doesn't officially endorse it. Use this app at your own risk.
-- The app keeps your checked games, goals, groups and statistics in `config.json`, and errors in `journal.txt`, next to `farm.py` or `SteamHoursFarm.exe`. These files stay on your PC. To update, replace the program files and keep `config.json`.
+- The app keeps your settings, checked games, goals, groups and statistics in `config.json`, and errors in `journal.txt`, next to `farm.py` or `SteamHoursFarm.exe`. These files stay on your PC. To update, replace the program files and keep `config.json`.
 - This project is not affiliated with Valve or Steam.
 
 ---
 
 ## En français
 
-**Farm d'heures Steam** fait tourner tes jeux Steam « à vide ». Steam croit que le jeu est lancé et compte le temps de jeu, ainsi que les drops de cartes, sans que le jeu démarre.
+**Farm d'heures Steam** fait tourner tes jeux Steam « à vide ». Steam croit que le jeu est lancé et compte le temps de jeu, ainsi que les drops de cartes, sans que le jeu démarre. L'interface est en français ou en anglais : tu choisis au premier lancement, et tu peux changer ensuite dans **Options**.
+
+![Fenêtre principale (données de démo)](docs/capture.png)
 
 **Installation :**
 
@@ -93,19 +101,25 @@ Dans tous les cas, il faut Steam ouvert et connecté, et au moins un jeu Steam i
 
 **Fonctions :**
 
-- **Objectif d'heures :** dans la bannière du jeu, règle le temps de jeu total à atteindre. Une fois atteint, le jeu sort du farm tout seul.
+- **Objectif d'heures :** dans la bannière du jeu, règle le temps de jeu total à atteindre. La bannière indique quand il sera atteint. Le bouton **＋ X h** fixe l'objectif au temps actuel plus quelques heures. Une fois l'objectif atteint, le jeu sort du farm tout seul.
 - **Plus de 32 jeux :** les jeux en trop attendent leur tour. L'appli change de groupe toutes les 2 heures (réglable dans **Options**).
+- **Pause quand tu joues :** si tu lances un vrai jeu, le farm se met en pause et reprend quand tu le quittes.
 - **Reprise automatique :** si Steam se ferme ou redémarre, le farm se met en pause et repart tout seul.
+- **Seulement quand tu n'es pas là** (option) : le farm ne tourne qu'après quelques minutes sans clavier ni souris.
+- **Mode invisible** (option) : tu passes en invisible sur Steam pendant le farm, et ton statut d'avant revient à l'arrêt.
 - **Alerte remboursement :** pour un jeu acheté il y a moins de 14 jours et joué moins de 2 h, l'appli te demande quoi faire : ne pas le farmer, le farmer jusqu'à 1 h 50 ou le farmer quand même.
 - **Statistiques :** heures farmées par jour sur 30 jours et jeux les plus farmés.
 - **Groupes :** enregistre les jeux cochés sous un nom et recoche-les en un clic.
-- **Options :** arrêt automatique après X heures, PC gardé éveillé, lancement avec Windows, ajout d'un jeu par son AppID.
+- **Options :** arrêt automatique après X heures, PC gardé éveillé, lancement avec Windows, langue, ajout d'un jeu par son AppID.
+
+![Statistiques (données de démo)](docs/stats.png)
 
 **À savoir :**
 
 - 1 h de farm donne 1 h sur chaque jeu farmé. On peut farmer jusqu'à 32 jeux en même temps.
 - Au-delà de 2 h de jeu, Steam ne rembourse plus le jeu.
-- Pour mettre à jour l'appli, remplace les fichiers du programme et garde `config.json` : il contient tes jeux cochés, tes objectifs, tes groupes et tes statistiques.
+- Un jeu farmé par un autre outil (ArchiSteamFarm par exemple) compte comme un vrai jeu et met le farm en pause. Si tu utilises les deux, décoche « Mettre le farm en pause quand je lance un vrai jeu » dans **Options**.
+- Pour mettre à jour l'appli, remplace les fichiers du programme et garde `config.json` : il contient tes réglages, tes jeux cochés, tes objectifs, tes groupes et tes statistiques.
 - Valve n'autorise pas officiellement cette pratique : c'est à tes risques.
 
 ## License
