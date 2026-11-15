@@ -39,8 +39,8 @@ from pathlib import Path
 
 NOM = "Automata"                  # nom affiché de l'appli
 VERSION = "1.5.0"
-PROJET = "https://github.com/Dekeur/steam-hours-farm"
-MAJ_API = "https://api.github.com/repos/Dekeur/steam-hours-farm/releases/latest"
+PROJET = "https://github.com/Dekeur/Automata-steam-plugins"
+MAJ_API = "https://api.github.com/repos/Dekeur/Automata-steam-plugins/releases/latest"
 GELE = getattr(sys, "frozen", False)          # True dans le .exe construit avec PyInstaller
 ICI = Path(sys.executable).resolve().parent if GELE else Path(__file__).resolve().parent
 SCRIPT = "" if GELE else str(Path(__file__).resolve())

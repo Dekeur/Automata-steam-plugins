@@ -41,7 +41,7 @@ You need Windows 10 or 11, the Steam client running and logged in, and at least 
 
 ### Download the .exe (easiest)
 
-1. Download `SteamHoursFarm-windows.zip` from the [latest release](https://github.com/Dekeur/steam-hours-farm/releases/latest).
+1. Download `SteamHoursFarm-windows.zip` from the [latest release](https://github.com/Dekeur/Automata-steam-plugins/releases/latest).
 2. Unzip it anywhere, for example in your Documents folder.
 3. Run `SteamHoursFarm.exe`.
 
@@ -105,7 +105,7 @@ The update check is a single request to `api.github.com` for the latest release 
 
 **Installation :**
 
-- **Le plus simple :** télécharge `SteamHoursFarm-windows.zip` depuis la [dernière version](https://github.com/Dekeur/steam-hours-farm/releases/latest), dézippe-le et lance `SteamHoursFarm.exe`. Si Windows affiche « Windows a protégé votre ordinateur », clique sur **Informations complémentaires → Exécuter quand même** : le .exe n'est pas signé.
+- **Le plus simple :** télécharge `SteamHoursFarm-windows.zip` depuis la [dernière version](https://github.com/Dekeur/Automata-steam-plugins/releases/latest), dézippe-le et lance `SteamHoursFarm.exe`. Si Windows affiche « Windows a protégé votre ordinateur », clique sur **Informations complémentaires → Exécuter quand même** : le .exe n'est pas signé.
 - **Depuis le code :** il te faut Python 3.10 ou plus récent (ou uv). Télécharge le dépôt (**Code → Download ZIP**), dézippe-le puis double-clique sur **`Lancer.bat`**.
 - **Construire le .exe toi-même :** double-clique sur **`construire_exe.bat`**.
 
