@@ -29,6 +29,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 import winreg
 from ctypes import wintypes
 from pathlib import Path
@@ -37,7 +38,7 @@ from pathlib import Path
 # les processus de farm restent ainsi très légers.
 
 NOM = "Automata"                  # nom affiché de l'appli
-VERSION = "1.4.0"
+VERSION = "1.5.0"
 PROJET = "https://github.com/Dekeur/steam-hours-farm"
 MAJ_API = "https://api.github.com/repos/Dekeur/steam-hours-farm/releases/latest"
 GELE = getattr(sys, "frozen", False)          # True dans le .exe construit avec PyInstaller
@@ -45,7 +46,9 @@ ICI = Path(sys.executable).resolve().parent if GELE else Path(__file__).resolve(
 SCRIPT = "" if GELE else str(Path(__file__).resolve())
 DLL = ICI / "steam_api64.dll"
 CONFIG = ICI / "config.json"
+CONFIG_SECOURS = ICI / "config.json.bak"   # dernière config lisible, recopiée à chaque lancement
 JOURNAL = ICI / "journal.txt"
+JOURNAL_MAX = 1_000_000                    # au-delà, journal.txt ne garde que sa fin
 SIGNAL = ICI / ".afficher"        # un 2e lancement demande à la fenêtre déjà ouverte de se montrer
 CLE_RUN = r"Software\Microsoft\Windows\CurrentVersion\Run"
 NOM_RUN = "FarmHeuresSteam"
@@ -137,10 +140,65 @@ def charger_langue() -> None:
 
 def journal(msg: str) -> None:
     try:
+        if JOURNAL.exists() and JOURNAL.stat().st_size > JOURNAL_MAX:
+            fin = JOURNAL.read_bytes()[-JOURNAL_MAX // 5:]
+            JOURNAL.write_bytes(fin[fin.find(b"\n") + 1:])
         with JOURNAL.open("a", encoding="utf-8") as f:
             f.write(time.strftime("%Y-%m-%d %H:%M:%S  ") + msg + "\n")
     except OSError:
         pass
+
+
+def ecrire_atomique(chemin: Path, texte: str) -> None:
+    """Écrit un fichier .tmp puis le met à la place de l'ancien : une coupure de courant pendant l'écriture
+    laisse l'ancien fichier intact au lieu d'un fichier à moitié écrit."""
+    tmp = chemin.with_name(chemin.name + ".tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write(texte)
+        f.flush()
+        os.fsync(f.fileno())
+    for essai in range(5):
+        try:
+            os.replace(tmp, chemin)
+            return
+        except PermissionError:          # fichier ouvert un instant par un antivirus, une sauvegarde…
+            time.sleep(0.1 * (essai + 1))
+    os.replace(tmp, chemin)
+
+
+def lire_config() -> dict:
+    """config.json. S'il est abîmé : la copie de secours, et le fichier abîmé est mis de côté (jamais écrasé).
+    Une config lisible est recopiée dans config.json.bak à chaque lancement."""
+    try:
+        brut = CONFIG.read_bytes()
+    except OSError:
+        return {}
+    try:
+        cfg = json.loads(brut.decode("utf-8"))
+        if not isinstance(cfg, dict):
+            raise ValueError("pas un objet JSON")
+    except ValueError as e:
+        abime = CONFIG.with_name(time.strftime("config.abime-%Y%m%d-%H%M%S.json"))
+        try:
+            shutil.copy2(CONFIG, abime)
+        except OSError:
+            pass
+        try:
+            cfg = json.loads(CONFIG_SECOURS.read_text(encoding="utf-8"))
+            if not isinstance(cfg, dict):
+                raise ValueError
+        except (OSError, ValueError):
+            journal(T("config.json illisible ({e}) et pas de copie de secours : réglages remis à zéro, "
+                      "fichier abîmé gardé dans {f}", e=e, f=abime.name))
+            return {}
+        journal(T("config.json illisible ({e}) : copie de secours reprise, fichier abîmé gardé dans {f}",
+                  e=e, f=abime.name))
+        return cfg
+    try:
+        ecrire_atomique(CONFIG_SECOURS, json.dumps(cfg))
+    except OSError:
+        pass
+    return cfg
 
 
 def interpreteur_sans_console(base: bool) -> str:
@@ -781,6 +839,20 @@ def succes_steam(appid: int, action: str = "lire", noms=(), icones: bool = True)
 
 # ───────────────────────── Petits outils ─────────────────────────
 
+def heure_plage(texte: str) -> int:
+    """Heure saisie dans Options (0 à 23) ; une saisie invalide vaut 0."""
+    v = nombre(texte)
+    return int(v) if 0 <= v < 24 else 0
+
+
+def dans_plage(heure: float, debut: int, fin: int) -> bool:
+    """heure (0 à 24, minutes en décimales) dans la plage [debut, fin[. La plage peut passer minuit (23 h → 8 h) ;
+    debut == fin veut dire toute la journée."""
+    if debut == fin:
+        return True
+    return debut <= heure < fin if debut < fin else heure >= debut or heure < fin
+
+
 def version_num(v: str) -> tuple[int, ...]:
     return tuple(int(x) for x in re.findall(r"\d+", v)[:3])
 
@@ -1031,10 +1103,7 @@ def interface(auto: bool, apres=None) -> None:
         def __init__(self, r: tk.Tk):
             global LANGUE
             self.r = r
-            try:
-                self.cfg = json.loads(CONFIG.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                self.cfg = {}
+            self.cfg = lire_config()
             c = self.cfg
             self.k = r.winfo_fpixels("1i") / 96          # facteur d'échelle (écrans à 125 %, 150 %…)
             self.steam: Path | None = None
@@ -1062,14 +1131,16 @@ def interface(auto: bool, apres=None) -> None:
             self.essais: dict[int, tuple[int, float]] = {}
             self.arretes: dict[int, float] = {}             # jeux arrêtés récemment -> heure de l'arrêt
             self.actif, self.debut, self.total_depart = False, 0.0, 0.0
-            self.pause: str | None = None                   # "steam", "jeu" (un vrai jeu est lancé) ou "pc"
+            self.pause: str | None = None   # "steam", "jeu" (vrai jeu lancé), "pc" (PC utilisé), "horaire"
             self.reprise_depuis: float | None = None
             self.jeu_reel: tuple[int, str] | None = None
             self.derniere_verif_jeu = 0.0
             self.statut_avant: int | None = c.get("statut_avant")
             self.derniere_rotation = 0.0
             self.dernier_tic = time.time()
-            self.tri = ("nom", False)
+            tri = c.get("tri")
+            self.tri = ((tri[0], bool(tri[1])) if isinstance(tri, list) and len(tri) == 2
+                        and tri[0] in ("nom", "temps", "objectif", "farme", "succes") else ("nom", False))
             self.sel: int | None = None
             self.chargement = None
             self.q: queue.Queue = queue.Queue()
@@ -1094,6 +1165,9 @@ def interface(auto: bool, apres=None) -> None:
             self.si_inactif = tk.BooleanVar(value=c.get("si_inactif", False))
             self.inactif_min = tk.StringVar(value=str(c.get("inactif_min", "10")))
             self.maj_auto = tk.BooleanVar(value=c.get("maj_auto", True))
+            self.plage = tk.BooleanVar(value=c.get("plage", False))
+            self.plage_debut = tk.StringVar(value=str(c.get("plage_debut", "23")))
+            self.plage_fin = tk.StringVar(value=str(c.get("plage_fin", "8")))
             self._style()
             # la langue n'est demandée qu'une fois : config.json de ce dossier, sinon celle déjà choisie sur ce PC
             langue = c.get("langue") if c.get("langue") in ("fr", "en") else langue_retenue()
@@ -1121,6 +1195,7 @@ def interface(auto: bool, apres=None) -> None:
             r, k = self.r, self.k
             self._taille(r, 1000, 740)
             r.minsize(*self._taille_min())
+            self._restaurer_fenetre()
             r.configure(bg=FOND)
             self._logo_tk = ImageTk.PhotoImage(dessiner_logo(64))
             r.iconphoto(True, self._logo_tk)
@@ -1200,6 +1275,23 @@ def interface(auto: bool, apres=None) -> None:
             l = min(int(l * self.k), fenetre.winfo_screenwidth() - int(40 * self.k))
             h = min(int(h * self.k), fenetre.winfo_screenheight() - int(110 * self.k))
             fenetre.geometry(f"{l}x{h}")
+
+        def _restaurer_fenetre(self):
+            """Taille et position de la dernière fois, si la fenêtre retombe bien sur un des écrans actuels."""
+            m = re.fullmatch(r"(\d+)x(\d+)\+(-?\d+)\+(-?\d+)", str(self.cfg.get("fenetre", "")))
+            if m:
+                l, h, x, y = map(int, m.groups())
+                u = ctypes.windll.user32
+                vx, vy, vl, vh = (u.GetSystemMetrics(i) for i in (76, 77, 78, 79))   # bureau virtuel (tous les écrans)
+                lmin, hmin = self._taille_min()
+                l, h = max(lmin, min(l, vl)), max(hmin, min(h, vh))
+                # la barre de titre doit rester attrapable : sinon, seule la taille est reprise
+                if vx - l + 150 <= x <= vx + vl - 150 and vy <= y <= vy + vh - 80:
+                    self.r.geometry(f"{l}x{h}+{x}+{y}")
+                else:
+                    self.r.geometry(f"{l}x{h}")
+            if self.cfg.get("agrandie"):
+                self.r.state("zoomed")
 
         def _taille_min(self) -> tuple[int, int]:
             r, k = self.r, self.k
@@ -1449,7 +1541,7 @@ def interface(auto: bool, apres=None) -> None:
             return w
 
         def _ouvrir_options(self):
-            w = self._fenetre("fen_options", T("Options"), (620, 850))
+            w = self._fenetre("fen_options", T("Options"), (620, 930))
             if w is None:
                 return
             k = self.k
@@ -1500,6 +1592,16 @@ def interface(auto: bool, apres=None) -> None:
                             variable=self.si_inactif, command=self._sauver).pack(side="left")
             spin(l, self.inactif_min, 1, 600).pack(side="left", padx=6)
             ttk.Label(l, text=T("min sans activité"), style="Doux.TLabel").pack(side="left")
+            l = ttk.Frame(f)
+            l.pack(fill="x", pady=(0, 2))
+            ttk.Checkbutton(l, text=T("Farmer seulement entre"), variable=self.plage,
+                            command=self._sauver).pack(side="left")
+            spin(l, self.plage_debut, 0, 23).pack(side="left", padx=6)
+            ttk.Label(l, text=T("h et"), style="Doux.TLabel").pack(side="left")
+            spin(l, self.plage_fin, 0, 23).pack(side="left", padx=6)
+            ttk.Label(l, text=T("h"), style="Doux.TLabel").pack(side="left")
+            note(T("Par exemple de 23 h à 8 h pour farmer la nuit. En dehors de ces heures, le farm se met en pause "
+                   "et reprend tout seul."))
             case(T("Mettre le farm en pause quand je lance un vrai jeu"), self.pause_jeu)
             case(T("Passer en invisible sur Steam pendant le farm"), self.invisible, self._regler_invisible)
             note(T("En invisible, tes amis ne te voient plus « En jeu ». Ton statut d'avant revient quand le farm "
@@ -2018,7 +2120,19 @@ def interface(auto: bool, apres=None) -> None:
             self.r.lift()
             self.r.focus_force()
 
+        def _noter_fenetre(self):
+            """Taille, position et état agrandi, seulement quand la fenêtre est affichée (pas cachée ni réduite)."""
+            try:
+                etat = self.r.state()
+                if etat == "normal":
+                    self.cfg["fenetre"] = self.r.geometry()
+                if etat in ("normal", "zoomed"):
+                    self.cfg["agrandie"] = etat == "zoomed"
+            except tk.TclError:
+                pass
+
         def _fermer(self):
+            self._noter_fenetre()                # avant de la cacher dans la zone de notification
             if self.actif and self.tray:
                 self.r.withdraw()
                 if not self.notifie:
@@ -2218,7 +2332,12 @@ def interface(auto: bool, apres=None) -> None:
             v = self.echecs.get(a)
             return T("refusé par Steam") if v == "refus" else T("arrêté (code {c})", c=v)
 
+        def _plage(self) -> tuple[int, int]:
+            return heure_plage(self.plage_debut.get()), heure_plage(self.plage_fin.get())
+
         def _texte_pause(self) -> str:
+            if self.pause == "horaire":
+                return T("⏸  En dehors de ta plage horaire : le farm reprend à {h}", h=T("{h} h", h=self._plage()[0]))
             if self.pause == "steam":
                 return T("⏸  Steam est fermé : le farm reprendra tout seul dès que Steam sera de retour")
             if self.pause == "jeu":
@@ -2940,6 +3059,11 @@ def interface(auto: bool, apres=None) -> None:
             """Pourquoi le farm doit rester en pause en ce moment (ou None)."""
             if steam_ferme or not steam_pret():
                 return "steam"
+            if self.plage.get():
+                debut, fin = self._plage()
+                t = time.localtime(now)
+                if not dans_plage(t.tm_hour + t.tm_min / 60, debut, fin):
+                    return "horaire"
             if self.pause_jeu.get():
                 if now - self.derniere_verif_jeu >= VERIF_JEU:
                     self.derniere_verif_jeu = now
@@ -2967,10 +3091,13 @@ def interface(auto: bool, apres=None) -> None:
                     elif raison == "jeu":
                         self._notifier(T("{nom} est lancé : le farm se met en pause jusqu'à ce que tu le quittes.",
                                          nom=self.jeu_reel[1]))
+                    elif raison == "horaire":
+                        self._notifier(T("Hors de ta plage horaire : le farm se met en pause jusqu'à {h}.",
+                                         h=T("{h} h", h=self._plage()[0])))
                     self._remplir()
             elif self.pause:
                 self.reprise_depuis = self.reprise_depuis or now
-                if now - self.reprise_depuis >= (0 if self.pause == "pc" else PAUSE_STEAM):
+                if now - self.reprise_depuis >= (0 if self.pause in ("pc", "horaire") else PAUSE_STEAM):
                     ancienne, self.pause, self.reprise_depuis = self.pause, None, None
                     if ancienne == "steam":
                         self.essais.clear()
@@ -2981,6 +3108,8 @@ def interface(auto: bool, apres=None) -> None:
                         self._notifier(T("Steam est revenu : le farm a repris."))
                     elif ancienne == "jeu":
                         self._notifier(T("Jeu quitté : le farm a repris."))
+                    elif ancienne == "horaire":
+                        self._notifier(T("Début de ta plage horaire : le farm a repris."))
                     self._remplir()
 
         def _verifier_objectifs(self):
@@ -3027,7 +3156,7 @@ def interface(auto: bool, apres=None) -> None:
             n = len(self.procs)
             if self.pause:
                 txt = self._texte_pause()
-                if self.reprise_depuis and self.pause != "pc":
+                if self.reprise_depuis and self.pause not in ("pc", "horaire"):
                     txt = T("↻  Reprise du farm dans {s} s",
                             s=max(0, int(PAUSE_STEAM - (now - self.reprise_depuis))))
             else:
@@ -3080,6 +3209,8 @@ def interface(auto: bool, apres=None) -> None:
                 coches=list(self.coches), heures=self.duree.get(), rotation=self.rotation.get(),
                 eveille=self.eveille.get(), invisible=self.invisible.get(), pause_jeu=self.pause_jeu.get(),
                 si_inactif=self.si_inactif.get(), inactif_min=self.inactif_min.get(), maj_auto=self.maj_auto.get(),
+                plage=self.plage.get(), plage_debut=self.plage_debut.get(), plage_fin=self.plage_fin.get(),
+                tri=list(self.tri),
                 farme={str(a): round(self._total(a)) for a in set(self.farme) | set(self.procs)},
                 objectifs={str(a): h for a, h in self.objectifs.items()}, atteints=sorted(self.atteints),
                 achats={str(a): t for a, t in self.achats.items()}, famille=sorted(self.famille),
@@ -3089,16 +3220,23 @@ def interface(auto: bool, apres=None) -> None:
                 self.cfg.pop("statut_avant", None)
             else:
                 self.cfg["statut_avant"] = self.statut_avant
+            self._noter_fenetre()
             try:
-                CONFIG.write_text(json.dumps(self.cfg), encoding="utf-8")
-            except OSError:
-                pass
+                ecrire_atomique(CONFIG, json.dumps(self.cfg))
+            except OSError as e:
+                journal(T("sauvegarde de config.json impossible : {e}", e=repr(e)))
 
     try:
         ctypes.windll.shcore.SetProcessDpiAwareness(1)
     except Exception:
         pass
+    def erreur(typ, val, tb):
+        journal(T("erreur : {e}", e="".join(traceback.format_exception(typ, val, tb)).rstrip()))
+
+    # pythonw et le .exe n'ont pas de console : sans ça, une erreur de l'interface ne laisserait aucune trace
+    threading.excepthook = lambda a: erreur(a.exc_type, a.exc_value, a.exc_traceback)
     r = tk.Tk()
+    r.report_callback_exception = erreur
     appli = Appli(r)
     if apres:
         r.after(200, lambda: apres(appli, r))
@@ -3136,6 +3274,24 @@ EN = {
     "Succès presque finis": "Achievements almost done",
     "Installer": "Install",
     "Mises à jour": "Updates",
+    "Farmer seulement entre": "Only farm between",
+    "h et": ":00 and",
+    "h": ":00",
+    "{h} h": "{h}:00",
+    "Par exemple de 23 h à 8 h pour farmer la nuit. En dehors de ces heures, le farm se met en pause "
+    "et reprend tout seul.":
+        "For example from 23:00 to 8:00 to farm at night. Outside these hours the farm pauses "
+        "and starts again by itself.",
+    "⏸  En dehors de ta plage horaire : le farm reprend à {h}": "⏸  Outside your farming hours: back at {h}",
+    "Hors de ta plage horaire : le farm se met en pause jusqu'à {h}.":
+        "Outside your farming hours: the farm pauses until {h}.",
+    "Début de ta plage horaire : le farm a repris.": "Your farming hours have started: the farm is running again.",
+    "config.json illisible ({e}) : copie de secours reprise, fichier abîmé gardé dans {f}":
+        "config.json unreadable ({e}): backup copy used, damaged file kept as {f}",
+    "config.json illisible ({e}) et pas de copie de secours : réglages remis à zéro, fichier abîmé gardé dans {f}":
+        "config.json unreadable ({e}) and no backup copy: settings reset, damaged file kept as {f}",
+    "sauvegarde de config.json impossible : {e}": "could not save config.json: {e}",
+    "erreur : {e}": "error: {e}",
     "Me prévenir quand une nouvelle version sort": "Tell me when a new version is out",
     "Une fois par jour au plus, l'appli demande à GitHub le numéro de la dernière version. "
     "Rien d'autre n'est envoyé : ni ton compte Steam, ni tes jeux.":

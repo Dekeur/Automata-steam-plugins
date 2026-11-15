@@ -12,6 +12,9 @@ dist/
 
 # Données locales de chaque utilisateur (jeux possédés, jeux cochés, compteurs, erreurs)
 config.json
+config.json.bak
+config.json.tmp
+config.abime-*.json
 journal.txt
 .afficher
 _verif_in.json

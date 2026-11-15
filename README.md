@@ -18,6 +18,7 @@ A small Windows app that idles your Steam games: Steam thinks the game is runnin
 - **Pauses while you play:** when you launch a real game, the farm pauses and starts again once you quit it.
 - **Steam restarts:** if Steam closes, crashes or updates, the farm pauses and starts again by itself once Steam is back.
 - **Only when you're away** (optional): idle only after a few minutes without keyboard or mouse input.
+- **Farming hours** (optional): idle only between two times, say 23:00 to 8:00. Outside them the farm pauses and starts again by itself.
 - **Invisible mode** (optional): go invisible on Steam while idling, so friends don't see you "In game". Your previous status comes back when the farm stops.
 - **Refund warning:** a game bought less than 14 days ago with less than 2 hours played triggers a prompt. You can skip it, idle it up to 1 h 50, or idle it anyway.
 - **Statistics:** hours idled per day over the last 30 days, and your most idled games.
@@ -26,7 +27,7 @@ A small Windows app that idles your Steam games: Steam thinks the game is runnin
 - **Install:** for a game you own but haven't installed, the banner button says **Install** (also in the right-click menu). It opens Steam's own install window.
 - **New version notice:** at most once a day, the app asks GitHub whether a newer version is out and shows a link at the top of the window. You can turn it off in Options.
 - Can stop after a set number of hours, and can keep the PC from going to sleep.
-- Keeps running in the system tray when you close the window.
+- Keeps running in the system tray when you close the window, and remembers the window size, its position and how the list is sorted.
 - Can start with Windows: it opens hidden and starts idling the games you checked once Steam is logged in.
 - Search, filters (checked, running, with a goal, refundable, never played, installed, achievements almost done) and a right-click menu.
 
@@ -91,6 +92,7 @@ The update check is a single request to `api.github.com` for the latest release 
 - **Achievements:** an unlocked achievement shows on your profile like any other, with the date you unlocked it, and your friends may see it in their activity feed. Ranking sites can spot achievements unlocked all at once, and some games protect theirs (Steam then refuses the change and the app tells you). Opening the window shows you "In game" for a few seconds.
 - Many players idle games with tools like Idle Master or ArchiSteamFarm, but Valve doesn't officially endorse it. Use this app at your own risk.
 - The app keeps your settings, checked games, goals, groups and statistics in `config.json`, and errors in `journal.txt`, next to `farm.py` or `SteamHoursFarm.exe`. These files stay on your PC. To update, replace the program files and keep `config.json`. The language you pick is also remembered in the registry (`HKEY_CURRENT_USER\Software\FarmHeuresSteam`), so a new version unzipped somewhere else doesn't ask again.
+- The app saves `config.json` in a way that can't leave it half-written, and keeps a copy of the last good one in `config.json.bak`. If `config.json` still gets damaged, the app starts from that copy and keeps the damaged file aside instead of overwriting it.
 - This project is not affiliated with Valve or Steam.
 
 ---
@@ -122,6 +124,7 @@ Dans tous les cas, il faut Steam ouvert et connecté, et au moins un jeu Steam i
 - **Pause quand tu joues :** si tu lances un vrai jeu, le farm se met en pause et reprend quand tu le quittes.
 - **Reprise automatique :** si Steam se ferme ou redémarre, le farm se met en pause et repart tout seul.
 - **Seulement quand tu n'es pas là** (option) : le farm ne tourne qu'après quelques minutes sans clavier ni souris.
+- **Plage horaire** (option) : le farm ne tourne qu'entre deux heures, par exemple de 23 h à 8 h. En dehors, il se met en pause et reprend tout seul.
 - **Mode invisible** (option) : tu passes en invisible sur Steam pendant le farm, et ton statut d'avant revient à l'arrêt.
 - **Alerte remboursement :** pour un jeu acheté il y a moins de 14 jours et joué moins de 2 h, l'appli te demande quoi faire : ne pas le farmer, le farmer jusqu'à 1 h 50 ou le farmer quand même.
 - **Statistiques :** heures farmées par jour sur 30 jours et jeux les plus farmés.
@@ -129,7 +132,8 @@ Dans tous les cas, il faut Steam ouvert et connecté, et au moins un jeu Steam i
 - **Succès :** bouton doré **Succès** dans la bannière, ou clic droit sur un jeu. Tu vois les succès du jeu avec leur icône, leur date de déblocage et la part des joueurs qui les ont. Tu peux débloquer ceux que tu sélectionnes, ou les re-verrouiller. La liste a aussi une colonne **Succès** (par exemple 12/76) pour tous tes jeux, lue dans le cache local de Steam, et un filtre **Succès presque finis** : les jeux où tu as au moins 80 % des succès, sans les avoir tous.
 - **Installer :** pour un jeu que tu possèdes sans l'avoir installé, le bouton de la bannière devient **Installer** (aussi dans le clic droit). Il ouvre la fenêtre d'installation de Steam.
 - **Nouvelle version :** une fois par jour au plus, l'appli demande à GitHub si une version plus récente est sortie et affiche un lien en haut de la fenêtre. Tu peux couper ça dans **Options**.
-- **Options :** arrêt automatique après X heures, PC gardé éveillé, lancement avec Windows, langue, avertissement de nouvelle version, ajout d'un jeu par son AppID.
+- **Options :** arrêt automatique après X heures, PC gardé éveillé, plage horaire, lancement avec Windows, langue, avertissement de nouvelle version, ajout d'un jeu par son AppID.
+- L'appli retient la taille et la position de la fenêtre, et le tri de la liste.
 
 ![Statistiques (données de démo)](docs/stats.png)
 
@@ -144,6 +148,7 @@ Dans tous les cas, il faut Steam ouvert et connecté, et au moins un jeu Steam i
 - Pour savoir s'il y a une nouvelle version, l'appli envoie une seule requête à GitHub, sans ton compte Steam, ni tes jeux, ni rien sur ton PC. GitHub voit ton adresse IP, comme n'importe quel site.
 - Un jeu farmé par un autre outil (ArchiSteamFarm par exemple) compte comme un vrai jeu et met le farm en pause. Si tu utilises les deux, décoche « Mettre le farm en pause quand je lance un vrai jeu » dans **Options**.
 - Pour mettre à jour l'appli, remplace les fichiers du programme et garde `config.json` : il contient tes réglages, tes jeux cochés, tes objectifs, tes groupes et tes statistiques. La langue choisie est aussi retenue dans le registre (`HKEY_CURRENT_USER\Software\FarmHeuresSteam`) : une nouvelle version dézippée ailleurs ne la redemande pas.
+- L'appli enregistre `config.json` sans risquer de le laisser à moitié écrit, et garde une copie de la dernière version lisible dans `config.json.bak`. Si `config.json` est quand même abîmé, elle repart de cette copie et met le fichier abîmé de côté au lieu de l'écraser.
 - Valve n'autorise pas officiellement cette pratique : c'est à tes risques.
 
 ## License
