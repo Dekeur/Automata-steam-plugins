@@ -1,5 +1,5 @@
 """
-Automata · Alter Ego (farm d'heures Steam / Steam hours farm)
+Automata (farm d'heures Steam / Steam hours farm)
 --------------------------------------
 Fait tourner tes jeux Steam « à vide » : Steam croit que le jeu est lancé et
 compte le temps de jeu (et les drops de cartes), sans rien exécuter du jeu.
@@ -36,8 +36,8 @@ from pathlib import Path
 # Pillow, pystray et tkinter ne sont importés que pour la fenêtre (voir interface()) :
 # les processus de farm restent ainsi très légers.
 
-NOM, SOUS_TITRE = "Automata", "Alter Ego"   # nom affiché de l'appli
-VERSION = "1.3.1"
+NOM = "Automata"                  # nom affiché de l'appli
+VERSION = "1.3.2"
 PROJET = "https://github.com/Dekeur/steam-hours-farm"
 GELE = getattr(sys, "frozen", False)          # True dans le .exe construit avec PyInstaller
 ICI = Path(sys.executable).resolve().parent if GELE else Path(__file__).resolve().parent
@@ -1024,7 +1024,7 @@ def interface(auto: bool, apres=None) -> None:
                 LANGUE = langue_systeme()
             else:
                 self._choisir_langue()
-            r.title(f"{NOM} · {SOUS_TITRE}")
+            r.title(NOM)
             self._construire()
             self._creer_tray()
             self._recharger()
@@ -1092,7 +1092,6 @@ def interface(auto: bool, apres=None) -> None:
                   indicatorbackground=[("selected", ACCENT)])
             s.configure("Vertical.TScrollbar", background=PANNEAU, troughcolor=FOND, arrowcolor=GRIS, borderwidth=0)
             s.configure("Titre.TLabel", font=("Segoe UI Semibold", 13))
-            s.configure("Ego.TLabel", foreground=EGO, font=("Segoe UI Semibold", 8))
             s.configure("Section.TLabel", font=("Segoe UI Semibold", 11), foreground=TEXTE)
             s.configure("Gris.TLabel", foreground=GRIS)
             s.configure("Doux.TLabel", foreground=DOUX)
@@ -1131,7 +1130,7 @@ def interface(auto: bool, apres=None) -> None:
             r.minsize(1, 1)
             r.resizable(False, False)
             r.geometry(f"{int(440 * k)}x{int(300 * k)}")
-            r.title(f"{NOM}  ·  {SOUS_TITRE}")
+            r.title(NOM)
             f = ttk.Frame(r, padding=int(26 * k))
             f.pack(fill="both", expand=True)
             self._logo_choix = ImageTk.PhotoImage(dessiner_logo(int(56 * k)))
@@ -1172,7 +1171,6 @@ def interface(auto: bool, apres=None) -> None:
             self._logo_haut = ImageTk.PhotoImage(dessiner_logo(int(26 * k)))
             ttk.Label(haut, image=self._logo_haut).pack(side="left", padx=(0, int(8 * k)))
             ttk.Label(haut, text=NOM, style="Titre.TLabel").pack(side="left")
-            ttk.Label(haut, text=SOUS_TITRE.upper(), style="Ego.TLabel").pack(side="left", padx=(int(8 * k), 0), pady=(3, 0))
             self.sous_titre = ttk.Label(haut, style="Gris.TLabel")
             self.sous_titre.pack(side="left", padx=(14, 0), pady=(3, 0))
             ttk.Button(haut, text=T("↻  Recharger"), command=self._recharger).pack(side="right")
@@ -1288,7 +1286,7 @@ def interface(auto: bool, apres=None) -> None:
             for w in self.r.winfo_children():
                 w.destroy()
             self.fen_stats = self.fen_options = self.fen_succes = None
-            self.r.title(f"{NOM} · {SOUS_TITRE}")
+            self.r.title(NOM)
             self._construire()
             if self.actif:
                 self.bouton.config(text=T("■  Arrêter le farm"), style="Arret.TButton")
