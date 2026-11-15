@@ -22,11 +22,13 @@ A small Windows app that idles your Steam games: Steam thinks the game is runnin
 - **Refund warning:** a game bought less than 14 days ago with less than 2 hours played triggers a prompt. You can skip it, idle it up to 1 h 50, or idle it anyway.
 - **Statistics:** hours idled per day over the last 30 days, and your most idled games.
 - **Groups:** save the games you checked under a name and check them all again in one click.
-- **Achievements:** the gold **Achievements** button in the banner (or a right-click on a game) shows the game's achievements with their icons, unlock dates and how many players have them. You can unlock the ones you select, or lock them again (see "Good to know"). Once you've opened it for a game, the button shows how many you've unlocked.
+- **Achievements:** the gold **Achievements** button in the banner (or a right-click on a game) shows the game's achievements with their icons, unlock dates and how many players have them. You can unlock the ones you select, or lock them again (see "Good to know"). The list also has an **Achievements** column (say 12/76) for every game, read from Steam's local cache, and an **Achievements almost done** filter for games where you have at least 80 % of them but not all.
+- **Install:** for a game you own but haven't installed, the banner button says **Install** (also in the right-click menu). It opens Steam's own install window.
+- **New version notice:** at most once a day, the app asks GitHub whether a newer version is out and shows a link at the top of the window. You can turn it off in Options.
 - Can stop after a set number of hours, and can keep the PC from going to sleep.
 - Keeps running in the system tray when you close the window.
 - Can start with Windows: it opens hidden and starts idling the games you checked once Steam is logged in.
-- Search, filters (checked, running, with a goal, refundable, never played, installed) and a right-click menu.
+- Search, filters (checked, running, with a goal, refundable, never played, installed, achievements almost done) and a right-click menu.
 
 ![Statistics window (demo data)](docs/stats-en.png)
 
@@ -75,6 +77,10 @@ A real game is spotted through the "running" flag Steam keeps for each game in t
 
 The Achievements window starts the same kind of background process for a few seconds and uses Steam's own achievement calls (`ISteamUserStats`): it reads the list, then `SetAchievement` or `ClearAchievement` and `StoreStats` when you unlock or lock achievements. Nothing is read until you open the window.
 
+The Achievements column reads Steam's local cache (`appcache\stats`): each game's achievement list, and which ones you have. Steam updates it when a game or its library page loads your achievements, so a count can be behind until then. Opening the Achievements window for a game refreshes its count.
+
+The update check is a single request to `api.github.com` for the latest release number, with a generic user agent (`SteamHoursFarm`). It sends nothing about your Steam account, your games or your PC. GitHub sees your IP address, as any website does.
+
 ## Good to know
 
 - **Steam counts real time.** One hour of idling adds one hour to each idled game. Nothing can speed that up, but you can idle several games at once.
@@ -120,8 +126,10 @@ Dans tous les cas, il faut Steam ouvert et connecté, et au moins un jeu Steam i
 - **Alerte remboursement :** pour un jeu acheté il y a moins de 14 jours et joué moins de 2 h, l'appli te demande quoi faire : ne pas le farmer, le farmer jusqu'à 1 h 50 ou le farmer quand même.
 - **Statistiques :** heures farmées par jour sur 30 jours et jeux les plus farmés.
 - **Groupes :** enregistre les jeux cochés sous un nom et recoche-les en un clic.
-- **Succès :** bouton doré **Succès** dans la bannière, ou clic droit sur un jeu. Tu vois les succès du jeu avec leur icône, leur date de déblocage et la part des joueurs qui les ont. Tu peux débloquer ceux que tu sélectionnes, ou les re-verrouiller. Une fois la fenêtre ouverte pour un jeu, le bouton affiche combien tu en as débloqué.
-- **Options :** arrêt automatique après X heures, PC gardé éveillé, lancement avec Windows, langue, ajout d'un jeu par son AppID.
+- **Succès :** bouton doré **Succès** dans la bannière, ou clic droit sur un jeu. Tu vois les succès du jeu avec leur icône, leur date de déblocage et la part des joueurs qui les ont. Tu peux débloquer ceux que tu sélectionnes, ou les re-verrouiller. La liste a aussi une colonne **Succès** (par exemple 12/76) pour tous tes jeux, lue dans le cache local de Steam, et un filtre **Succès presque finis** : les jeux où tu as au moins 80 % des succès, sans les avoir tous.
+- **Installer :** pour un jeu que tu possèdes sans l'avoir installé, le bouton de la bannière devient **Installer** (aussi dans le clic droit). Il ouvre la fenêtre d'installation de Steam.
+- **Nouvelle version :** une fois par jour au plus, l'appli demande à GitHub si une version plus récente est sortie et affiche un lien en haut de la fenêtre. Tu peux couper ça dans **Options**.
+- **Options :** arrêt automatique après X heures, PC gardé éveillé, lancement avec Windows, langue, avertissement de nouvelle version, ajout d'un jeu par son AppID.
 
 ![Statistiques (données de démo)](docs/stats.png)
 
@@ -132,6 +140,8 @@ Dans tous les cas, il faut Steam ouvert et connecté, et au moins un jeu Steam i
 - 1 h de farm donne 1 h sur chaque jeu farmé. On peut farmer jusqu'à 32 jeux en même temps.
 - Au-delà de 2 h de jeu, Steam ne rembourse plus le jeu.
 - Un succès débloqué avec l'appli apparaît sur ton profil comme les autres, avec la date du déblocage, et tes amis peuvent le voir dans leur fil d'activité. Des sites de classement repèrent les succès débloqués tous d'un coup, et certains jeux protègent les leurs : Steam refuse alors le changement et l'appli te le dit. Ouvrir la fenêtre Succès te met « En jeu » quelques secondes.
+- La colonne Succès vient du cache de Steam : un compte peut avoir du retard tant que le jeu, ou sa page dans la bibliothèque, n'a pas rechargé tes succès. Ouvrir la fenêtre Succès d'un jeu remet son compte à jour.
+- Pour savoir s'il y a une nouvelle version, l'appli envoie une seule requête à GitHub, sans ton compte Steam, ni tes jeux, ni rien sur ton PC. GitHub voit ton adresse IP, comme n'importe quel site.
 - Un jeu farmé par un autre outil (ArchiSteamFarm par exemple) compte comme un vrai jeu et met le farm en pause. Si tu utilises les deux, décoche « Mettre le farm en pause quand je lance un vrai jeu » dans **Options**.
 - Pour mettre à jour l'appli, remplace les fichiers du programme et garde `config.json` : il contient tes réglages, tes jeux cochés, tes objectifs, tes groupes et tes statistiques. La langue choisie est aussi retenue dans le registre (`HKEY_CURRENT_USER\Software\FarmHeuresSteam`) : une nouvelle version dézippée ailleurs ne la redemande pas.
 - Valve n'autorise pas officiellement cette pratique : c'est à tes risques.

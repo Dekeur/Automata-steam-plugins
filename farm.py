@@ -37,8 +37,9 @@ from pathlib import Path
 # les processus de farm restent ainsi très légers.
 
 NOM = "Automata"                  # nom affiché de l'appli
-VERSION = "1.3.2"
+VERSION = "1.4.0"
 PROJET = "https://github.com/Dekeur/steam-hours-farm"
+MAJ_API = "https://api.github.com/repos/Dekeur/steam-hours-farm/releases/latest"
 GELE = getattr(sys, "frozen", False)          # True dans le .exe construit avec PyInstaller
 ICI = Path(sys.executable).resolve().parent if GELE else Path(__file__).resolve().parent
 SCRIPT = "" if GELE else str(Path(__file__).resolve())
@@ -69,7 +70,9 @@ BARRE = "#3b8fd0"                 # barres des statistiques (validée pour le fo
 EGO = "#ff374d"                   # rouge du logo Automata
 OR = "#f0c75a"                    # bouton Succès (trophée)
 FILTRES = (("tous", "Tous les jeux"), ("coches", "Cochés"), ("encours", "En cours"), ("objectif", "Avec objectif"),
-           ("remb", "Remboursables"), ("jamais", "Jamais lancés"), ("installes", "Installés"))
+           ("remb", "Remboursables"), ("jamais", "Jamais lancés"), ("installes", "Installés"),
+           ("presque", "Succès presque finis"))
+PRESQUE = 0.8                     # filtre « Succès presque finis » : au moins 80 % des succès, sans les avoir tous
 FILTRES_SUCCES = (("tous", "Tous les succès"), ("verrouilles", "Verrouillés"), ("debloques", "Débloqués"))
 JOURS = {"fr": ("lun.", "mar.", "mer.", "jeu.", "ven.", "sam.", "dim."),
          "en": ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")}
@@ -316,6 +319,93 @@ def temps_de_jeu(steam: Path) -> dict[int, int]:
     return {}
 
 
+def lire_kv_binaire(data: bytes, p: int = 0, chaines: list[str] | None = None) -> tuple[dict, int]:
+    """KeyValues binaire de Steam (appinfo.vdf, appcache/stats) -> (dictionnaire aux clés en minuscules, position
+    après la fin). chaines : table des clés du format v29 d'appinfo.vdf (les clés y sont des index)."""
+    def cstr(p: int) -> tuple[str, int]:
+        fin = data.index(b"\0", p)
+        return data[p:fin].decode("utf-8", "replace"), fin + 1
+
+    d: dict = {}
+    while p < len(data):
+        t = data[p]
+        p += 1
+        if t in (8, 11):
+            break
+        if chaines is None:
+            k, p = cstr(p)
+        else:
+            k = chaines[struct.unpack_from("<i", data, p)[0]]
+            p += 4
+        if t == 0:
+            v, p = lire_kv_binaire(data, p, chaines)
+        elif t == 1:
+            v, p = cstr(p)
+        elif t == 2:
+            v, p = struct.unpack_from("<i", data, p)[0], p + 4
+        elif t == 3:
+            v, p = struct.unpack_from("<f", data, p)[0], p + 4
+        elif t in (4, 6):
+            v, p = struct.unpack_from("<I", data, p)[0], p + 4
+        elif t in (7, 10):
+            v, p = struct.unpack_from("<q", data, p)[0], p + 8
+        else:
+            raise ValueError(f"type {t}")
+        d[k.lower()] = v
+    return d, p
+
+
+def compte_utilisateur(steam: Path) -> int:
+    """Compte Steam connecté, sinon le dernier connecté sur ce PC (loginusers.vdf). 0 si aucun."""
+    uid = utilisateur_actif()
+    if uid:
+        return uid
+    try:
+        users = lire_vdf(steam / "config" / "loginusers.vdf").get("users", {})
+    except (OSError, ValueError):
+        return 0
+    # « MostRecent » n'est plus écrit par les Steam récents : sinon, la dernière connexion (« Timestamp »)
+    comptes = []
+    for sid, u in users.items():
+        if isinstance(u, dict) and sid.isdigit():
+            t = str(u.get("timestamp", ""))
+            comptes.append((u.get("mostrecent") == "1", int(t) if t.isdigit() else 0, int(sid)))
+    return max(comptes)[2] & 0xFFFFFFFF if comptes else 0
+
+
+def succes_locaux(steam: Path, uid: int) -> dict[int, tuple[int, int]]:
+    """appid -> (succès débloqués, total), lus dans le cache de Steam (appcache/stats) sans lancer le jeu.
+    Le schéma donne les succès (bits des stats de type ACHIEVEMENTS), le fichier du joueur les bits débloqués.
+    Steam tient ce cache à jour quand le jeu ou la page du jeu lit les succès : il peut avoir du retard."""
+    out: dict[int, tuple[int, int]] = {}
+    dossier = steam / "appcache" / "stats"
+    if not uid or not dossier.is_dir():
+        return out
+    for f in dossier.glob("UserGameStatsSchema_*.bin"):
+        appid = f.stem.rpartition("_")[2]
+        if not appid.isdigit():
+            continue
+        try:
+            schema, _ = lire_kv_binaire(f.read_bytes())
+            racine = next((v for v in schema.values() if isinstance(v, dict)), {})
+            joueur = steam / "appcache" / "stats" / f"UserGameStats_{uid}_{appid}.bin"
+            cache = lire_kv_binaire(joueur.read_bytes())[0].get("cache", {}) if joueur.exists() else {}
+            faits = total = 0
+            for sid, st in (racine.get("stats") or {}).items():
+                if not isinstance(st, dict) or not isinstance(st.get("bits"), dict):
+                    continue
+                donnees = cache.get(sid)
+                masque = int(donnees.get("data", 0) or 0) & 0xFFFFFFFF if isinstance(donnees, dict) else 0
+                for b in st["bits"]:
+                    total += 1
+                    faits += (masque >> int(b)) & 1 if b.isdigit() and int(b) < 32 else 0
+        except (OSError, ValueError, IndexError, struct.error):
+            continue
+        if total:
+            out[int(appid)] = (faits, total)
+    return out
+
+
 def infos_applis(steam: Path) -> dict[int, tuple[str, str, bool]]:
     """appid -> (nom, type, gratuit) lus dans appcache/appinfo.vdf (format binaire de Steam)."""
     data = (steam / "appcache" / "appinfo.vdf").read_bytes()
@@ -334,36 +424,6 @@ def infos_applis(steam: Path) -> dict[int, tuple[str, str, bool]]:
             chaines.append(data[p:fin].decode("utf-8", "replace"))
             p = fin + 1
 
-    def cstr(p: int) -> tuple[str, int]:
-        fin = data.index(b"\0", p)
-        return data[p:fin].decode("utf-8", "replace"), fin + 1
-
-    def kv(p: int) -> tuple[dict, int]:
-        d: dict = {}
-        while True:
-            t = data[p]
-            p += 1
-            if t in (8, 11):
-                return d, p
-            if chaines is None:
-                k, p = cstr(p)
-            else:
-                k = chaines[struct.unpack_from("<i", data, p)[0]]
-                p += 4
-            if t == 0:
-                v, p = kv(p)
-            elif t == 1:
-                v, p = cstr(p)
-            elif t == 2:
-                v, p = struct.unpack_from("<i", data, p)[0], p + 4
-            elif t in (3, 4, 6):
-                v, p = None, p + 4
-            elif t in (7, 10):
-                v, p = None, p + 8
-            else:
-                raise ValueError(f"type {t}")
-            d[k.lower()] = v
-
     # après appid+taille : état, maj, jeton(8), sha1(20), n° de changement, [sha1 binaire(20)]
     entete = 40 + (0 if magique == 0x07564427 else 20)
     out: dict[int, tuple[str, str, bool]] = {}
@@ -372,7 +432,7 @@ def infos_applis(steam: Path) -> dict[int, tuple[str, str, bool]]:
         if appid == 0:
             break
         try:
-            d, _ = kv(pos + 8 + entete)
+            d, _ = lire_kv_binaire(data, pos + 8 + entete, chaines)
             ai = d.get("appinfo") or {}
             c, ext = ai.get("common") or {}, ai.get("extended") or {}
             if c.get("name"):
@@ -721,6 +781,25 @@ def succes_steam(appid: int, action: str = "lire", noms=(), icones: bool = True)
 
 # ───────────────────────── Petits outils ─────────────────────────
 
+def version_num(v: str) -> tuple[int, ...]:
+    return tuple(int(x) for x in re.findall(r"\d+", v)[:3])
+
+
+def derniere_version() -> str | None:
+    """Numéro de la dernière version publiée sur GitHub, None sans réponse. La requête ne contient que l'adresse
+    MAJ_API et un User-Agent générique : ni cookie, ni compte Steam, ni liste de jeux, ni info sur le PC."""
+    import urllib.request
+    req = urllib.request.Request(MAJ_API, headers={"User-Agent": "SteamHoursFarm",
+                                                   "Accept": "application/vnd.github+json"})
+    try:
+        with urllib.request.urlopen(req, timeout=10) as rep:
+            tag = json.loads(rep.read(500_000).decode("utf-8")).get("tag_name", "")
+    except Exception:  # noqa: BLE001 — pas de réseau, GitHub indisponible… : on réessaiera plus tard
+        return None
+    tag = str(tag).strip().lstrip("vV")
+    return tag if re.fullmatch(r"\d+(\.\d+){0,3}", tag) else None
+
+
 def hms(s: float) -> str:
     s = int(s)
     return f"{s // 3600}:{s // 60 % 60:02d}:{s % 60:02d}"
@@ -962,6 +1041,7 @@ def interface(auto: bool, apres=None) -> None:
             self.jeux: dict[int, dict] = {}               # appid -> {"nom", "min"}
             self.infos: dict[int, tuple] = {}
             self.installes: set[int] = set()
+            self.succes_cache: dict[int, tuple[int, int]] = {}   # appid -> (débloqués, total), cache de Steam
             self.gratuits: set[int] = set()
             self.chemins: dict[int, dict] = {}
             self.icones: dict[int, Image.Image] = {}
@@ -1013,6 +1093,7 @@ def interface(auto: bool, apres=None) -> None:
             self.pause_jeu = tk.BooleanVar(value=c.get("pause_jeu", True))
             self.si_inactif = tk.BooleanVar(value=c.get("si_inactif", False))
             self.inactif_min = tk.StringVar(value=str(c.get("inactif_min", "10")))
+            self.maj_auto = tk.BooleanVar(value=c.get("maj_auto", True))
             self._style()
             # la langue n'est demandée qu'une fois : config.json de ce dossier, sinon celle déjà choisie sur ce PC
             langue = c.get("langue") if c.get("langue") in ("fr", "en") else langue_retenue()
@@ -1031,6 +1112,7 @@ def interface(auto: bool, apres=None) -> None:
             r.protocol("WM_DELETE_WINDOW", self._fermer)
             r.after(150, self._pomper)
             r.after(500, self._tic)
+            r.after(4000, self._verifier_maj)
             if auto:
                 r.withdraw()
 
@@ -1095,6 +1177,7 @@ def interface(auto: bool, apres=None) -> None:
             s.configure("Section.TLabel", font=("Segoe UI Semibold", 11), foreground=TEXTE)
             s.configure("Gris.TLabel", foreground=GRIS)
             s.configure("Doux.TLabel", foreground=DOUX)
+            s.configure("Lien.TLabel", foreground=ACCENT, font=("Segoe UI Semibold", 10))
             s.configure("Ban.TLabel", background="#262c36", foreground=DOUX)
             s.configure("Ban.TFrame", background="#262c36")
             s.configure("Ligne.TFrame", background=BORD)
@@ -1176,6 +1259,9 @@ def interface(auto: bool, apres=None) -> None:
             ttk.Button(haut, text=T("↻  Recharger"), command=self._recharger).pack(side="right")
             ttk.Button(haut, text=T("Options"), command=self._ouvrir_options).pack(side="right", padx=(0, 8))
             ttk.Button(haut, text=T("Statistiques"), command=self._ouvrir_stats).pack(side="right", padx=(0, 8))
+            # « Nouvelle version x.y.z » : affichée par _montrer_maj seulement s'il y en a une
+            self.l_maj = ttk.Label(haut, style="Lien.TLabel", cursor="hand2")
+            self.l_maj.bind("<Button-1>", lambda e: os.startfile(PROJET + "/releases/latest"))
 
             # bannière du jeu sélectionné
             self.ban = tk.Canvas(r, height=int(250 * k), bg=FOND, highlightthickness=0, bd=0)
@@ -1205,7 +1291,7 @@ def interface(auto: bool, apres=None) -> None:
             self.b_farm = ttk.Button(self.ban, style="Accent.TButton", width=17, text=T("＋  Ajouter au farm"),
                                      command=self._basculer_selection)
             self.b_steam = ttk.Button(self.ban, text=T("Ouvrir dans Steam"), style="Verre.TButton",
-                                      command=lambda: self._ouvrir("steam://nav/games/details/{}"))
+                                      command=self._bouton_steam)
             self._trophee_tk = ImageTk.PhotoImage(dessiner_trophee(int(18 * k)))
             self.b_succes = ttk.Button(self.ban, text=T("Succès"), image=self._trophee_tk, compound="left",
                                        style="Succes.TButton", command=lambda: self._ouvrir_succes())
@@ -1223,7 +1309,7 @@ def interface(auto: bool, apres=None) -> None:
             self.champ.pack(side="left", fill="x", expand=True)
             self.filtre = tk.StringVar(value=T(FILTRES[0][1]))
             cb = ttk.Combobox(barre, textvariable=self.filtre, values=[T(l) for _, l in FILTRES],
-                              state="readonly", width=15)
+                              state="readonly", width=max(15, max(len(T(l)) for _, l in FILTRES) + 1))
             cb.pack(side="left", padx=(10, 0))
             cb.bind("<<ComboboxSelected>>", lambda e: (self._remplir(), self.arbre.focus_set()))
             self.b_groupes = ttk.Button(barre, text=T("Groupes  ▾"), command=self._menu_groupes)
@@ -1243,12 +1329,13 @@ def interface(auto: bool, apres=None) -> None:
             # liste
             milieu = ttk.Frame(r, padding=(m18, 0, m18, 0))
             milieu.pack(fill="both", expand=True)
-            self.arbre = ttk.Treeview(milieu, columns=("temps", "objectif", "farme"), show="tree headings",
+            self.arbre = ttk.Treeview(milieu, columns=("temps", "objectif", "farme", "succes"),
+                                      show="tree headings",
                                       selectmode="extended")
             self.arbre.heading("#0", text=T("Jeu"), anchor="w", command=lambda: self._trier("nom"))
             self.arbre.column("#0", width=int(420 * k), stretch=True)
             for col, titre, larg in (("temps", "Temps Steam", 120), ("objectif", "Objectif", 140),
-                                     ("farme", "Farmé ici", 140)):
+                                     ("farme", "Farmé ici", 140), ("succes", "Succès", 125)):
                 self.arbre.heading(col, text=T(titre), anchor="e", command=lambda c=col: self._trier(c))
                 self.arbre.column(col, width=int(larg * k), anchor="e", stretch=False)
             sb = ttk.Scrollbar(milieu, orient="vertical", command=self.arbre.yview)
@@ -1300,6 +1387,7 @@ def interface(auto: bool, apres=None) -> None:
             if self.tray:
                 self.tray.title = NOM
             self._maj_menu_tray()
+            self._montrer_maj()
             self._sauver()
             self._ouvrir_options()
 
@@ -1361,7 +1449,7 @@ def interface(auto: bool, apres=None) -> None:
             return w
 
         def _ouvrir_options(self):
-            w = self._fenetre("fen_options", T("Options"), (620, 750))
+            w = self._fenetre("fen_options", T("Options"), (620, 850))
             if w is None:
                 return
             k = self.k
@@ -1426,6 +1514,11 @@ def interface(auto: bool, apres=None) -> None:
             cb.pack(anchor="w", pady=(0, int(12 * k)))
             cb.bind("<<ComboboxSelected>>", lambda e: self.r.after(
                 10, lambda: self._changer_langue(next(c for c, n in LANGUES if n == langue.get()))))
+
+            titre(T("Mises à jour"))
+            case(T("Me prévenir quand une nouvelle version sort"), self.maj_auto, self._regler_maj)
+            note(T("Une fois par jour au plus, l'appli demande à GitHub le numéro de la dernière version. "
+                   "Rien d'autre n'est envoyé : ni ton compte Steam, ni tes jeux."))
 
             titre(T("Ajouter un jeu par son AppID"))
             l = ttk.Frame(f)
@@ -1663,8 +1756,8 @@ def interface(auto: bool, apres=None) -> None:
             if variante == "icone":
                 self.b_succes.config(text="", compound="image")
                 return
-            vu = self.cfg.get("succes_vus", {}).get(str(self.sel))
-            texte = T("Succès  {f}/{n}", f=vu[0], n=vu[1]) if variante == "compte" and vu and vu[1] else T("Succès")
+            vu = self._succes_compte(self.sel)
+            texte = T("Succès  {f}/{n}", f=vu[0], n=vu[1]) if variante == "compte" and vu else T("Succès")
             self.b_succes.config(text=texte, compound="left")
 
         def _succes_ouverte(self) -> bool:
@@ -1716,9 +1809,12 @@ def interface(auto: bool, apres=None) -> None:
                 return
             self.succes_liste = res.get("succes", [])
             # compte gardé en config pour l'afficher sur le bouton de la bannière
-            self.cfg.setdefault("succes_vus", {})[str(a)] = [sum(x["fait"] for x in self.succes_liste),
-                                                             len(self.succes_liste)]
+            compte = [sum(x["fait"] for x in self.succes_liste), len(self.succes_liste)]
+            self.cfg.setdefault("succes_vus", {})[str(a)] = compte
+            if compte[1]:
+                self.succes_cache[a] = tuple(compte)
             self._sauver()
+            self._maj_ligne(a)
             if self.sel == a:
                 self._planifier_banniere()
             self.succes_icones, self._succes_tk = {}, {}
@@ -1861,6 +1957,45 @@ def interface(auto: bool, apres=None) -> None:
                 journal(T("icône de notification impossible : {e}", e=repr(e)))
                 self.tray = None
 
+        # ── nouvelle version ──
+        def _verifier_maj(self, forcer: bool = False):
+            """Demande à GitHub la dernière version (une fois par jour au plus), dans un fil à part."""
+            self._montrer_maj()                  # version trouvée lors d'une vérification précédente
+            if not self.maj_auto.get():
+                return
+            if not forcer and time.time() - float(self.cfg.get("maj_verifiee", 0)) < 24 * 3600:
+                return
+
+            def tache():
+                v = derniere_version()
+                self.q.put(lambda: self._maj_recue(v))
+            threading.Thread(target=tache, daemon=True).start()
+
+        def _maj_recue(self, v: str | None):
+            if v is None:
+                return
+            self.cfg["maj_verifiee"] = time.time()
+            self.cfg["maj_version"] = v
+            self._sauver()
+            self._montrer_maj()
+
+        def _montrer_maj(self):
+            v = str(self.cfg.get("maj_version", ""))
+            if self.maj_auto.get() and v and version_num(v) > version_num(VERSION):
+                self.l_maj.config(text=T("Nouvelle version {v}  ↗", v=v))
+                if not self.l_maj.winfo_ismapped():
+                    self.l_maj.pack(side="right", padx=(0, int(16 * self.k)), pady=(3, 0))
+                if self.cfg.get("maj_notifiee") != v:      # une seule notification par version
+                    self.cfg["maj_notifiee"] = v
+                    self._sauver()
+                    self._notifier(T("La version {v} est disponible sur GitHub.", v=v))
+            else:
+                self.l_maj.pack_forget()
+
+        def _regler_maj(self):
+            self._sauver()
+            self._verifier_maj()
+
         def _notifier(self, texte: str):
             journal(texte)
             if self.tray:
@@ -1982,18 +2117,20 @@ def interface(auto: bool, apres=None) -> None:
                 s = int(24 * self.k)
                 chemins = {a: chemins_images(steam, a) for a in jeux}
                 icones = {a: icone_jeu(chemins[a].get("icone"), infos.get(a, ("?",))[0], s) for a in jeux}
-                self.chargement = (steam, jeux, infos, temps, installes, verif, chemins, icones, note, None)
+                succes = succes_locaux(steam, compte_utilisateur(steam))
+                self.chargement = (steam, jeux, infos, temps, installes, verif, chemins, icones, succes, note, None)
             except Exception as e:  # noqa: BLE001 — affiché dans la fenêtre
                 journal(T("chargement : {e}", e=repr(e)))
-                self.chargement = (None, set(), {}, {}, set(), None, {}, {}, "", repr(e))
+                self.chargement = (None, set(), {}, {}, set(), None, {}, {}, {}, "", repr(e))
 
         def _appliquer_chargement(self):
-            steam, jeux, infos, temps, installes, verif, chemins, icones, note, err = self.chargement
+            steam, jeux, infos, temps, installes, verif, chemins, icones, succes, note, err = self.chargement
             self.chargement = None
             if err:
                 self.sous_titre.config(text=T("impossible de lire Steam : {e}", e=err))
                 return
             self.steam, self.infos, self.installes = steam, infos, installes
+            self.succes_cache = succes
             self.gratuits = {a for a, i in infos.items() if i[2]}
             self.chemins.update(chemins)
             self.icones.update(icones)
@@ -2007,6 +2144,7 @@ def interface(auto: bool, apres=None) -> None:
                 self._sauver()
             self._maj_sous_titre(note)
             self._remplir()
+            self._planifier_banniere()           # installé ou non, compte des succès : le bouton peut changer
             if self.sel not in self.jeux:
                 premier = next((a for a in self.arbre.get_children() if int(a) in self.coches), None) \
                           or next(iter(self.arbre.get_children()), None)
@@ -2173,6 +2311,8 @@ def interface(auto: bool, apres=None) -> None:
             yb = h - int(20 * k)
             c.coords(self.b_w_obj, marge, yb)
             c.coords(self.b_w_farm, w - marge, yb)
+            # jeu possédé mais pas installé : le bouton Steam propose de l'installer
+            self.b_steam.config(text=T("Installer") if self._a_installer(a) else T("Ouvrir dans Steam"))
             self.r.update_idletasks()
             x_steam = w - marge - self.b_farm.winfo_reqwidth() - int(10 * k)
             c.coords(self.b_w_steam, x_steam, yb)
@@ -2304,7 +2444,17 @@ def interface(auto: bool, apres=None) -> None:
                 o = f"✓  {objectif_txt(obj)}" if p >= 1 else T("{p}  de {o}", p=pct(int(p * 100)), o=objectif_txt(obj))
             else:
                 o = ""
-            return (heures(self._temps_steam(a) / 60), o, f)
+            n = self._succes_compte(a)
+            return (heures(self._temps_steam(a) / 60), o, f, f"{n[0]}/{n[1]}" if n else "")
+
+        def _succes_compte(self, a: int | None) -> tuple[int, int] | None:
+            """(débloqués, total) : cache de Steam, sinon le dernier compte lu dans la fenêtre Succès."""
+            n = self.succes_cache.get(a) or self.cfg.get("succes_vus", {}).get(str(a))
+            return (int(n[0]), int(n[1])) if n and n[1] else None
+
+        def _presque_fini(self, a: int) -> bool:
+            n = self._succes_compte(a)
+            return bool(n) and PRESQUE <= n[0] / n[1] < 1
 
         def _tags(self, a: int):
             if a in self.procs:
@@ -2327,7 +2477,8 @@ def interface(auto: bool, apres=None) -> None:
             f = self._filtre_cle()
             return (f == "tous" or (f == "coches" and a in self.coches) or (f == "encours" and a in self.procs)
                     or (f == "objectif" and a in self.objectifs) or (f == "remb" and self._remboursable(a))
-                    or (f == "jamais" and not self.jeux[a]["min"]) or (f == "installes" and a in self.installes))
+                    or (f == "jamais" and not self.jeux[a]["min"]) or (f == "installes" and a in self.installes)
+                    or (f == "presque" and self._presque_fini(a)))
 
         def _remplir(self):
             q = self.recherche.get().strip().lower()
@@ -2337,8 +2488,12 @@ def interface(auto: bool, apres=None) -> None:
             cles = {"nom": lambda a: self.jeux[a]["nom"].lower(), "temps": self._temps_steam,
                     "objectif": lambda a: (self._temps_steam(a) / (self.objectifs[a] * 3600)
                                            if a in self.objectifs else -1),
-                    "farme": self._total}
-            for a in sorted(self.jeux, key=cles[cle], reverse=inverse):
+                    "farme": self._total,
+                    "succes": lambda a: (n[0] / n[1], n[1]) if (n := self._succes_compte(a)) else (-1, 0)}
+            ordre = sorted(self.jeux, key=cles[cle], reverse=inverse)
+            if cle == "succes":                  # les jeux sans succès restent en bas, dans les deux sens
+                ordre.sort(key=lambda a: self._succes_compte(a) is None)
+            for a in ordre:
                 if self._visible(a, q):
                     self.arbre.insert("", "end", iid=str(a), text="  " + self.jeux[a]["nom"],
                                       image=self._image_ligne(a), values=self._valeurs(a), tags=self._tags(a))
@@ -2346,7 +2501,7 @@ def interface(auto: bool, apres=None) -> None:
             if garde:
                 self.arbre.selection_set(garde)
             for col, titre in (("#0", "Jeu"), ("temps", "Temps Steam"), ("objectif", "Objectif"),
-                               ("farme", "Farmé ici")):
+                               ("farme", "Farmé ici"), ("succes", "Succès")):
                 fleche = (" ▼" if inverse else " ▲") if (cle == "nom" and col == "#0") or cle == col else ""
                 self.arbre.heading(col, text=T(titre) + fleche)
 
@@ -2359,7 +2514,7 @@ def interface(auto: bool, apres=None) -> None:
                 self._maj_ligne(a)
 
         def _trier(self, col: str):
-            self.tri = (col, not self.tri[1] if self.tri[0] == col else col in ("temps", "objectif", "farme"))
+            self.tri = (col, not self.tri[1] if self.tri[0] == col else col in ("temps", "objectif", "farme", "succes"))
             self._remplir()
 
         def _selection(self, _=None):
@@ -2407,6 +2562,8 @@ def interface(auto: bool, apres=None) -> None:
             m.add_command(label=T("Farmer encore quelques heures…"), command=lambda: self._encore_dialogue(ids))
             m.add_separator()
             m.add_command(label=T("Succès…"), command=lambda: self._ouvrir_succes(a))
+            if self._a_installer(a):
+                m.add_command(label=T("Installer"), command=lambda: self._installer(a))
             m.add_command(label=T("Ouvrir dans la bibliothèque Steam"),
                           command=lambda: self._ouvrir("steam://nav/games/details/{}", a))
             m.add_command(label=T("Page du magasin"),
@@ -2452,6 +2609,20 @@ def interface(auto: bool, apres=None) -> None:
             a_cocher = [a for a in ids if a not in self.coches]
             if a_cocher:
                 self._basculer_jeux(a_cocher)
+
+        def _a_installer(self, a: int | None) -> bool:
+            """Jeu de la liste qui n'est installé dans aucune bibliothèque Steam (le farm marche quand même)."""
+            return a in self.jeux and bool(self.installes) and a not in self.installes
+
+        def _bouton_steam(self):
+            if self._a_installer(self.sel):
+                self._installer(self.sel)
+            else:
+                self._ouvrir("steam://nav/games/details/{}")
+
+        def _installer(self, a: int):
+            """Ouvre la fenêtre d'installation de Steam (dossier, taille…) : c'est Steam qui demande confirmation."""
+            self._ouvrir("steam://install/{}", a)
 
         def _ouvrir(self, modele: str, a: int | None = None):
             a = a or self.sel
@@ -2908,7 +3079,7 @@ def interface(auto: bool, apres=None) -> None:
             self.cfg.update(
                 coches=list(self.coches), heures=self.duree.get(), rotation=self.rotation.get(),
                 eveille=self.eveille.get(), invisible=self.invisible.get(), pause_jeu=self.pause_jeu.get(),
-                si_inactif=self.si_inactif.get(), inactif_min=self.inactif_min.get(),
+                si_inactif=self.si_inactif.get(), inactif_min=self.inactif_min.get(), maj_auto=self.maj_auto.get(),
                 farme={str(a): round(self._total(a)) for a in set(self.farme) | set(self.procs)},
                 objectifs={str(a): h for a, h in self.objectifs.items()}, atteints=sorted(self.atteints),
                 achats={str(a): t for a, t in self.achats.items()}, famille=sorted(self.famille),
@@ -2962,6 +3133,16 @@ EN = {
     "Remboursables": "Refundable",
     "Jamais lancés": "Never played",
     "Installés": "Installed",
+    "Succès presque finis": "Achievements almost done",
+    "Installer": "Install",
+    "Mises à jour": "Updates",
+    "Me prévenir quand une nouvelle version sort": "Tell me when a new version is out",
+    "Une fois par jour au plus, l'appli demande à GitHub le numéro de la dernière version. "
+    "Rien d'autre n'est envoyé : ni ton compte Steam, ni tes jeux.":
+        "At most once a day, the app asks GitHub for the latest version number. "
+        "Nothing else is sent: not your Steam account, not your games.",
+    "Nouvelle version {v}  ↗": "New version {v}  ↗",
+    "La version {v} est disponible sur GitHub.": "Version {v} is available on GitHub.",
     # sous-titre
     "{n} jeu": "{n} game",
     "{n} jeux": "{n} games",
