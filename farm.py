@@ -37,7 +37,7 @@ from pathlib import Path
 # les processus de farm restent ainsi très légers.
 
 NOM, SOUS_TITRE = "Automata", "Alter Ego"   # nom affiché de l'appli
-VERSION = "1.3.0"
+VERSION = "1.3.1"
 PROJET = "https://github.com/Dekeur/steam-hours-farm"
 GELE = getattr(sys, "frozen", False)          # True dans le .exe construit avec PyInstaller
 ICI = Path(sys.executable).resolve().parent if GELE else Path(__file__).resolve().parent
