@@ -1,5 +1,5 @@
 """
-Farm d'heures Steam / Steam Hours Farm
+Automata · Alter Ego (farm d'heures Steam / Steam hours farm)
 --------------------------------------
 Fait tourner tes jeux Steam « à vide » : Steam croit que le jeu est lancé et
 compte le temps de jeu (et les drops de cartes), sans rien exécuter du jeu.
@@ -36,6 +36,7 @@ from pathlib import Path
 # Pillow, pystray et tkinter ne sont importés que pour la fenêtre (voir interface()) :
 # les processus de farm restent ainsi très légers.
 
+NOM, SOUS_TITRE = "Automata", "Alter Ego"   # nom affiché de l'appli
 VERSION = "1.3.0"
 PROJET = "https://github.com/Dekeur/steam-hours-farm"
 GELE = getattr(sys, "frozen", False)          # True dans le .exe construit avec PyInstaller
@@ -65,6 +66,7 @@ TEXTE, DOUX, GRIS = "#eef0f4", "#c3c8d2", "#8b93a3"
 ACCENT, ACCENT_CLAIR, ENCRE = "#66c0f4", "#93d5fb", "#0b1220"
 VERT, ROUGE, ORANGE, SELECTION = "#7bd88f", "#f08080", "#f0b45a", "#263850"
 BARRE = "#3b8fd0"                 # barres des statistiques (validée pour le fond sombre)
+EGO = "#ff374d"                   # rouge du logo Automata
 OR = "#f0c75a"                    # bouton Succès (trophée)
 FILTRES = (("tous", "Tous les jeux"), ("coches", "Cochés"), ("encours", "En cours"), ("objectif", "Avec objectif"),
            ("remb", "Remboursables"), ("jamais", "Jamais lancés"), ("installes", "Installés"))
@@ -852,18 +854,16 @@ def arrondir(im, rayon_rel: float = 0.2):
 
 
 def dessiner_logo(n: int):
-    """Logo de l'appli : carré arrondi bleu Steam avec un sablier stylisé."""
+    """Logo de l'appli : logo.png (rond rouge), à côté du script ou embarqué dans le .exe. Rond rouge de secours."""
     from PIL import Image, ImageDraw
+    for dossier in (Path(getattr(sys, "_MEIPASS", ICI)), ICI):
+        try:
+            return Image.open(dossier / "logo.png").convert("RGBA").resize((n, n), Image.LANCZOS)
+        except OSError:
+            pass
     t = n * 4
     im = Image.new("RGBA", (t, t), (0, 0, 0, 0))
-    d = ImageDraw.Draw(im)
-    d.rounded_rectangle((0, 0, t - 1, t - 1), int(t * 0.24), fill="#1b2838")
-    d.rounded_rectangle((int(t * .06), int(t * .06), int(t * .94), int(t * .94)), int(t * .2), outline=ACCENT,
-                        width=max(4, int(t * .05)))
-    a, b, m = t * .30, t * .70, t / 2
-    d.polygon([(a, t * .26), (b, t * .26), (m + t * .03, m), (b, t * .74), (a, t * .74), (m - t * .03, m)], fill=ACCENT)
-    d.polygon([(a + t * .06, t * .30), (b - t * .06, t * .30), (m, t * .46)], fill="#1b2838")
-    d.polygon([(m, t * .58), (b - t * .07, t * .70), (a + t * .07, t * .70)], fill="#1b2838")
+    ImageDraw.Draw(im).ellipse((0, 0, t - 1, t - 1), fill=EGO)
     return im.resize((n, n), Image.LANCZOS)
 
 
@@ -1024,7 +1024,7 @@ def interface(auto: bool, apres=None) -> None:
                 LANGUE = langue_systeme()
             else:
                 self._choisir_langue()
-            r.title(T("Farm d'heures Steam"))
+            r.title(f"{NOM} · {SOUS_TITRE}")
             self._construire()
             self._creer_tray()
             self._recharger()
@@ -1092,6 +1092,7 @@ def interface(auto: bool, apres=None) -> None:
                   indicatorbackground=[("selected", ACCENT)])
             s.configure("Vertical.TScrollbar", background=PANNEAU, troughcolor=FOND, arrowcolor=GRIS, borderwidth=0)
             s.configure("Titre.TLabel", font=("Segoe UI Semibold", 13))
+            s.configure("Ego.TLabel", foreground=EGO, font=("Segoe UI Semibold", 8))
             s.configure("Section.TLabel", font=("Segoe UI Semibold", 11), foreground=TEXTE)
             s.configure("Gris.TLabel", foreground=GRIS)
             s.configure("Doux.TLabel", foreground=DOUX)
@@ -1130,7 +1131,7 @@ def interface(auto: bool, apres=None) -> None:
             r.minsize(1, 1)
             r.resizable(False, False)
             r.geometry(f"{int(440 * k)}x{int(300 * k)}")
-            r.title("Farm d'heures Steam  ·  Steam Hours Farm")
+            r.title(f"{NOM}  ·  {SOUS_TITRE}")
             f = ttk.Frame(r, padding=int(26 * k))
             f.pack(fill="both", expand=True)
             self._logo_choix = ImageTk.PhotoImage(dessiner_logo(int(56 * k)))
@@ -1168,7 +1169,10 @@ def interface(auto: bool, apres=None) -> None:
             # barre du haut
             haut = ttk.Frame(r, padding=(m18, int(10 * k), m18, int(8 * k)))
             haut.pack(fill="x")
-            ttk.Label(haut, text=T("Farm d'heures Steam"), style="Titre.TLabel").pack(side="left")
+            self._logo_haut = ImageTk.PhotoImage(dessiner_logo(int(26 * k)))
+            ttk.Label(haut, image=self._logo_haut).pack(side="left", padx=(0, int(8 * k)))
+            ttk.Label(haut, text=NOM, style="Titre.TLabel").pack(side="left")
+            ttk.Label(haut, text=SOUS_TITRE.upper(), style="Ego.TLabel").pack(side="left", padx=(int(8 * k), 0), pady=(3, 0))
             self.sous_titre = ttk.Label(haut, style="Gris.TLabel")
             self.sous_titre.pack(side="left", padx=(14, 0), pady=(3, 0))
             ttk.Button(haut, text=T("↻  Recharger"), command=self._recharger).pack(side="right")
@@ -1284,7 +1288,7 @@ def interface(auto: bool, apres=None) -> None:
             for w in self.r.winfo_children():
                 w.destroy()
             self.fen_stats = self.fen_options = self.fen_succes = None
-            self.r.title(T("Farm d'heures Steam"))
+            self.r.title(f"{NOM} · {SOUS_TITRE}")
             self._construire()
             if self.actif:
                 self.bouton.config(text=T("■  Arrêter le farm"), style="Arret.TButton")
@@ -1296,7 +1300,7 @@ def interface(auto: bool, apres=None) -> None:
                 self.arbre.see(str(sel))
             self._planifier_banniere()
             if self.tray:
-                self.tray.title = T("Farm d'heures Steam")
+                self.tray.title = NOM
             self._maj_menu_tray()
             self._sauver()
             self._ouvrir_options()
@@ -1853,7 +1857,7 @@ def interface(auto: bool, apres=None) -> None:
                     M(lambda _: T("Statistiques"), lambda: self.q.put(lambda: (self._montrer(), self._ouvrir_stats()))),
                     pystray.Menu.SEPARATOR,
                     M(lambda _: T("Quitter"), lambda: self.q.put(self._quitter)))
-                self.tray = pystray.Icon(NOM_RUN, dessiner_logo(64), T("Farm d'heures Steam"), menu)
+                self.tray = pystray.Icon(NOM_RUN, dessiner_logo(64), NOM, menu)
                 self.tray.run_detached()
             except Exception as e:  # noqa: BLE001
                 journal(T("icône de notification impossible : {e}", e=repr(e)))
@@ -1863,7 +1867,7 @@ def interface(auto: bool, apres=None) -> None:
             journal(texte)
             if self.tray:
                 try:
-                    self.tray.notify(texte, T("Farm d'heures Steam"))
+                    self.tray.notify(texte, NOM)
                 except Exception:
                     pass
 
@@ -2163,7 +2167,7 @@ def interface(auto: bool, apres=None) -> None:
                     pass
             self._ban_tk = ImageTk.PhotoImage(base)
             c.itemconfig(self.b_img, image=self._ban_tk)
-            nom = self.jeux[a]["nom"] if a in self.jeux else (T("Farm d'heures Steam") if not a else f"App {a}")
+            nom = self.jeux[a]["nom"] if a in self.jeux else (NOM if not a else f"App {a}")
             c.itemconfig(self.b_nom, text="" if a_logo else nom, width=int(w * .6))
             c.coords(self.b_nom, marge, bas_logo)
             c.coords(self.b_stats, marge, bas_logo + int(12 * k))
@@ -2649,7 +2653,7 @@ def interface(auto: bool, apres=None) -> None:
                 return
             if not DLL.exists():
                 if interactif:
-                    messagebox.showerror(T("Farm d'heures Steam"),
+                    messagebox.showerror(NOM,
                                          T("steam_api64.dll introuvable.\n"
                                            "Installe n'importe quel jeu Steam puis clique Recharger."))
                 return
@@ -2754,7 +2758,7 @@ def interface(auto: bool, apres=None) -> None:
                 if not self.etat.cget("text"):
                     total = sum(self._total(a) for a in self.farme)
                     self.etat.config(text=T("Total farmé avec l'appli : {h}", h=heures(total / 60, None)))
-                self._titre_tray(T("Farm d'heures Steam"))
+                self._titre_tray(NOM)
                 # statut resté invisible (Steam fermé à l'arrêt, PC éteint pendant le farm) : remis dès que possible
                 if self.statut_avant is not None and not self.auto:
                     self._restaurer_statut()
@@ -2868,9 +2872,9 @@ def interface(auto: bool, apres=None) -> None:
                 if self.echecs:
                     txt += T("  ·  {n} refusé(s)", n=len(self.echecs))
             self.etat.config(text=txt)
-            self._titre_tray(pluriel(n, "Farm d'heures Steam — {n} jeu en cours",
-                                     "Farm d'heures Steam — {n} jeux en cours")
-                             if not self.pause else T("Farm d'heures Steam — en pause"))
+            self._titre_tray(pluriel(n, "Automata — {n} jeu en cours",
+                                     "Automata — {n} jeux en cours")
+                             if not self.pause else T("Automata — en pause"))
 
         def _titre_tray(self, titre: str):
             if self.tray and self.tray.title != titre:
@@ -2937,7 +2941,6 @@ def interface(auto: bool, apres=None) -> None:
 
 EN = {
     # titres, boutons, colonnes
-    "Farm d'heures Steam": "Steam Hours Farm",
     "↻  Recharger": "↻  Reload",
     "Statistiques": "Statistics",
     "Options": "Options",
@@ -3028,9 +3031,9 @@ EN = {
         "At Windows startup, the app opens hidden and farms your checked games.",
     "Ne se lance plus avec Windows.": "No longer starts with Windows.",
     "Impossible de régler le démarrage : {e}": "Couldn't change the startup setting: {e}",
-    "Farm d'heures Steam — {n} jeu en cours": "Steam Hours Farm — {n} game running",
-    "Farm d'heures Steam — {n} jeux en cours": "Steam Hours Farm — {n} games running",
-    "Farm d'heures Steam — en pause": "Steam Hours Farm — paused",
+    "Automata — {n} jeu en cours": "Automata — {n} game running",
+    "Automata — {n} jeux en cours": "Automata — {n} games running",
+    "Automata — en pause": "Automata — paused",
     # bannière
     "Coche des jeux dans la liste, puis Démarrer le farm.": "Check games in the list, then click Start farming.",
     "Temps Steam  {t}      Farmé ici  {f}      AppID  {a}": "Steam time  {t}      Farmed here  {f}      AppID  {a}",

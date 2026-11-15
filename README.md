@@ -1,4 +1,8 @@
-# Steam Hours Farm
+![Automata · Alter Ego](docs/banniere.png)
+
+# Automata
+
+*Alter Ego: it plays your Steam games for you.*
 
 A small Windows app that idles your Steam games: Steam thinks the game is running and counts the playtime (trading card drops included), but the game itself never starts. The interface is in English or French: you pick the language on first launch and can change it later in Options.
 
@@ -87,7 +91,7 @@ The Achievements window starts the same kind of background process for a few sec
 
 ## En français
 
-**Farm d'heures Steam** fait tourner tes jeux Steam « à vide ». Steam croit que le jeu est lancé et compte le temps de jeu, ainsi que les drops de cartes, sans que le jeu démarre. L'interface est en français ou en anglais : tu choisis au premier lancement, et tu peux changer ensuite dans **Options**.
+**Automata** (alias Alter Ego) fait tourner tes jeux Steam « à vide ». Steam croit que le jeu est lancé et compte le temps de jeu, ainsi que les drops de cartes, sans que le jeu démarre. L'interface est en français ou en anglais : tu choisis au premier lancement, et tu peux changer ensuite dans **Options**.
 
 ![Fenêtre principale (données de démo)](docs/capture.png)
 

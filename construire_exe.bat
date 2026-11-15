@@ -17,7 +17,7 @@ where py >nul 2>nul || set "PY=python"
 .venv-build\Scripts\python.exe -m pip install -r requirements.txt pyinstaller || goto erreur
 
 :construire
-.venv-build\Scripts\python.exe -m PyInstaller --noconfirm --clean --windowed --onedir --name SteamHoursFarm --icon icone.ico --hidden-import pystray._win32 farm.py || goto erreur
+.venv-build\Scripts\python.exe -m PyInstaller --noconfirm --clean --windowed --onedir --name SteamHoursFarm --icon icone.ico --add-data "logo.png;." --hidden-import pystray._win32 farm.py || goto erreur
 rem Zip avec une date fixe : il ne garde ni l'heure ni le fuseau horaire de la construction.
 .venv-build\Scripts\python.exe -c "import os, zipfile; z = zipfile.ZipFile(r'dist\SteamHoursFarm-windows.zip', 'w'); [z.writestr(zipfile.ZipInfo(os.path.relpath(os.path.join(d, f), 'dist').replace(os.sep, '/'), (2026, 1, 1, 0, 0, 0)), open(os.path.join(d, f), 'rb').read(), zipfile.ZIP_DEFLATED, 9) for d, _, fs in sorted(os.walk(r'dist\SteamHoursFarm')) for f in sorted(fs)]; z.close()" || goto erreur
 echo.
