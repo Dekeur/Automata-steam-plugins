@@ -36,7 +36,7 @@ from pathlib import Path
 # Pillow, pystray et tkinter ne sont importés que pour la fenêtre (voir interface()) :
 # les processus de farm restent ainsi très légers.
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 PROJET = "https://github.com/Dekeur/steam-hours-farm"
 GELE = getattr(sys, "frozen", False)          # True dans le .exe construit avec PyInstaller
 ICI = Path(sys.executable).resolve().parent if GELE else Path(__file__).resolve().parent
@@ -47,6 +47,7 @@ JOURNAL = ICI / "journal.txt"
 SIGNAL = ICI / ".afficher"        # un 2e lancement demande à la fenêtre déjà ouverte de se montrer
 CLE_RUN = r"Software\Microsoft\Windows\CurrentVersion\Run"
 NOM_RUN = "FarmHeuresSteam"
+CLE_APPLI = r"Software\FarmHeuresSteam"   # langue retenue pour tout le PC (valeur « Langue »)
 MAX_SIMULTANES = 32               # Steam refuse au-delà de 32 jeux lancés en même temps
 APP_TEST = 480                    # Spacewar, gratuit pour tous : sert à interroger Steam
 SANS_FENETRE = 0x08000000         # CREATE_NO_WINDOW
@@ -64,8 +65,10 @@ TEXTE, DOUX, GRIS = "#eef0f4", "#c3c8d2", "#8b93a3"
 ACCENT, ACCENT_CLAIR, ENCRE = "#66c0f4", "#93d5fb", "#0b1220"
 VERT, ROUGE, ORANGE, SELECTION = "#7bd88f", "#f08080", "#f0b45a", "#263850"
 BARRE = "#3b8fd0"                 # barres des statistiques (validée pour le fond sombre)
+OR = "#f0c75a"                    # bouton Succès (trophée)
 FILTRES = (("tous", "Tous les jeux"), ("coches", "Cochés"), ("encours", "En cours"), ("objectif", "Avec objectif"),
            ("remb", "Remboursables"), ("jamais", "Jamais lancés"), ("installes", "Installés"))
+FILTRES_SUCCES = (("tous", "Tous les succès"), ("verrouilles", "Verrouillés"), ("debloques", "Débloqués"))
 JOURS = {"fr": ("lun.", "mar.", "mer.", "jeu.", "ven.", "sam.", "dim."),
          "en": ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")}
 MOIS_EN = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
@@ -95,13 +98,36 @@ def langue_systeme() -> str:
         return "en"
 
 
-def charger_langue() -> None:
-    global LANGUE
+def langue_retenue() -> str | None:
+    """Langue déjà choisie sur ce PC, même par une autre copie de l'appli (une nouvelle version dézippée
+    ailleurs, par exemple) : elle est gardée dans le registre en plus de config.json."""
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, CLE_APPLI) as k:
+            v = winreg.QueryValueEx(k, "Langue")[0]
+    except OSError:
+        return None
+    return v if v in ("fr", "en") else None
+
+
+def retenir_langue(code: str) -> None:
+    try:
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, CLE_APPLI) as k:
+            winreg.SetValueEx(k, "Langue", 0, winreg.REG_SZ, code)
+    except OSError:
+        pass
+
+
+def langue_config() -> str | None:
     try:
         choix = json.loads(CONFIG.read_text(encoding="utf-8")).get("langue")
     except (OSError, ValueError, AttributeError):
-        choix = None
-    LANGUE = choix if choix in ("fr", "en") else langue_systeme()
+        return None
+    return choix if choix in ("fr", "en") else None
+
+
+def charger_langue() -> None:
+    global LANGUE
+    LANGUE = langue_config() or langue_retenue() or langue_systeme()
 
 
 def journal(msg: str) -> None:
@@ -512,6 +538,185 @@ def verifier_possession(ids: list[int]) -> dict | None:
             "famille": set(res.get("famille", []))}
 
 
+# ───────────────────────── Succès (achievements) ─────────────────────────
+
+def _attendre_steam(api, test, delai: float, pas: float = 0.05):
+    """Fait tourner les rappels de Steam jusqu'à ce que test() soit vrai (ou que le délai soit écoulé)."""
+    fin = time.time() + delai
+    while True:
+        api.SteamAPI_RunCallbacks()
+        v = test()
+        if v or time.time() >= fin:
+            return v
+        time.sleep(pas)
+
+
+def mode_succes(appid: int, entree: Path, sortie: Path) -> int:
+    """Lit les succès du jeu `appid`, et les débloque ou les re-verrouille si on le demande (fenêtre Succès)."""
+    os.environ["SteamAppId"] = os.environ["SteamGameId"] = str(appid)
+    demande = json.loads(entree.read_text(encoding="utf-8"))
+    res: dict = {}
+    api, ok, msg = _steam_api()
+    if not ok:
+        res.update(erreur="init", detail=msg)
+        code = 4
+    else:
+        try:
+            code = _succes(api, demande, res)
+        except Exception as e:  # noqa: BLE001 — renvoyé à la fenêtre
+            res.update(erreur="exception", detail=repr(e))
+            code = 6
+        api.SteamAPI_Shutdown()
+    sortie.write_text(json.dumps(res), encoding="utf-8")
+    return code
+
+
+def _succes(api, demande: dict, res: dict) -> int:
+    c, P = ctypes, ctypes.c_void_p
+
+    def f(nom, restype, *argtypes):
+        if not nom or not hasattr(api, nom):
+            return None
+        fn = getattr(api, nom)
+        fn.restype, fn.argtypes = restype, list(argtypes)
+        return fn
+
+    fab = next((n for n in ("SteamAPI_SteamUserStats_v013", "SteamAPI_SteamUserStats_v012",
+                            "SteamAPI_SteamUserStats_v011") if hasattr(api, n)), None)
+    s = "SteamAPI_ISteamUserStats_"
+    nombre_succes = f(s + "GetNumAchievements", c.c_uint32, P)
+    nom_succes = f(s + "GetAchievementName", c.c_char_p, P, c.c_uint32)
+    etat = f(s + "GetAchievementAndUnlockTime", c.c_bool, P, c.c_char_p, c.POINTER(c.c_bool), c.POINTER(c.c_uint32))
+    if not (fab and nombre_succes and nom_succes and etat):
+        res["erreur"] = "dll"
+        return 7
+    stats = f(fab, P)()
+    demander = f(s + "RequestCurrentStats", c.c_bool, P)
+    attribut = f(s + "GetAchievementDisplayAttribute", c.c_char_p, P, c.c_char_p, c.c_char_p)
+    poser = f(s + "SetAchievement", c.c_bool, P, c.c_char_p)
+    effacer = f(s + "ClearAchievement", c.c_bool, P, c.c_char_p)
+    stocker = f(s + "StoreStats", c.c_bool, P)
+    icone = f(s + "GetAchievementIcon", c.c_int, P, c.c_char_p)
+    demander_pct = f(s + "RequestGlobalAchievementPercentages", c.c_uint64, P)
+    pct = f(s + "GetAchievementAchievedPercent", c.c_bool, P, c.c_char_p, c.POINTER(c.c_float))
+    fab_utils = next((n for n in ("SteamAPI_SteamUtils_v010", "SteamAPI_SteamUtils_v009") if hasattr(api, n)), None)
+    utils = f(fab_utils, P)() if fab_utils else None
+    taille_image = f("SteamAPI_ISteamUtils_GetImageSize", c.c_bool, P, c.c_int, c.POINTER(c.c_uint32),
+                     c.POINTER(c.c_uint32))
+    image_rgba = f("SteamAPI_ISteamUtils_GetImageRGBA", c.c_bool, P, c.c_int, c.c_void_p, c.c_int)
+
+    def lu(n: bytes):
+        fait, quand = c.c_bool(), c.c_uint32()
+        if not etat(stats, n, c.byref(fait), c.byref(quand)):
+            return None                                    # stats du joueur pas encore reçues
+        return bool(fait.value), int(quand.value)
+
+    # 1) liste des succès (schéma du jeu) puis état du joueur, envoyés par le client Steam
+    if demander:
+        demander(stats)
+    if not _attendre_steam(api, lambda: nombre_succes(stats) > 0, 8):
+        res["succes"] = []                                 # pas de succès dans ce jeu
+        return 0
+    noms = [nom_succes(stats, i) for i in range(nombre_succes(stats))]
+    noms = [n for n in noms if n]
+    if not _attendre_steam(api, lambda: lu(noms[0]) is not None, 15):
+        res["erreur"] = "stats"
+        return 8
+
+    # 2) débloquer ou re-verrouiller
+    action = demande.get("action", "lire")
+    texte = {n.decode("utf-8", "replace"): n for n in noms}
+    voulus = [texte[n] for n in demande.get("noms", []) if n in texte]
+    if action in ("debloquer", "verrouiller") and voulus and poser and effacer and stocker:
+        attendu = action == "debloquer"
+        changes = [n for n in voulus if (lu(n) or (None,))[0] != attendu and (poser if attendu else effacer)(stats, n)]
+        if changes:
+            res["stockage"] = bool(stocker(stats))
+            _attendre_steam(api, lambda: False, 5)                 # le serveur de Steam confirme ou annule
+            if demander:
+                demander(stats)
+                _attendre_steam(api, lambda: False, 2)
+
+    # 3) état, date, nom et description de chaque succès
+    res["succes"] = []
+    for n in noms:
+        fait, quand = lu(n) or (False, 0)
+
+        def attr(cle):
+            v = attribut(stats, n, cle) if attribut else None
+            return v.decode("utf-8", "replace") if v else ""
+        ident = n.decode("utf-8", "replace")
+        res["succes"].append({"id": ident, "nom": attr(b"name") or ident, "desc": attr(b"desc"),
+                              "cache": attr(b"hidden") == "1", "fait": fait, "date": quand if fait else 0})
+    if action in ("debloquer", "verrouiller"):
+        cibles = {n.decode("utf-8", "replace") for n in voulus}
+        res["refuses"] = [x["id"] for x in res["succes"] if x["id"] in cibles and x["fait"] != (action == "debloquer")]
+
+    # 4) pourcentage des joueurs qui ont chaque succès
+    if demander_pct and pct:
+        demander_pct(stats)
+        p = c.c_float()
+        if _attendre_steam(api, lambda: pct(stats, noms[0], c.byref(p)), 6):
+            for n, x in zip(noms, res["succes"]):
+                if pct(stats, n, c.byref(p)):
+                    x["pct"] = round(float(p.value), 1)
+
+    # 5) icônes (en couleur si débloqué, grisées sinon) : 0 tant que Steam les télécharge
+    if demande.get("icones") and demande.get("fichier_icones") and icone and utils and taille_image and image_rgba:
+        poignees: dict[bytes, int] = {}
+
+        def charger():
+            for n in noms:
+                if n not in poignees:
+                    h = icone(stats, n)
+                    if h > 0:
+                        poignees[n] = h
+            return len(poignees) == len(noms)
+        _attendre_steam(api, charger, 8, pas=0.3)
+        blob, index = bytearray(), {}
+        for n, h in poignees.items():
+            l, ht = c.c_uint32(), c.c_uint32()
+            if taille_image(utils, h, c.byref(l), c.byref(ht)) and 0 < l.value <= 256 and 0 < ht.value <= 256:
+                w, hh = l.value, ht.value
+                buf = c.create_string_buffer(w * hh * 4)
+                if image_rgba(utils, h, buf, len(buf)):
+                    brut, saut = buf.raw, max(1, max(w, hh) // 64)
+                    if saut > 1:                           # 256 px -> 64 px (1 pixel sur `saut`)
+                        px = memoryview(brut).cast("I")
+                        brut = b"".join(px[y * w:(y + 1) * w:saut].tobytes() for y in range(0, hh, saut))
+                        w, hh = len(range(0, w, saut)), len(range(0, hh, saut))
+                    index[n.decode("utf-8", "replace")] = [len(blob), w, hh]
+                    blob += brut
+        Path(demande["fichier_icones"]).write_bytes(bytes(blob))
+        res["icones"] = index
+    return 0
+
+
+def succes_steam(appid: int, action: str = "lire", noms=(), icones: bool = True) -> dict:
+    """Lance le processus --succes et renvoie sa réponse (avec les icônes brutes dans "_icones")."""
+    entree, sortie, fichier = ICI / "_succes_in.json", ICI / "_succes_out.json", ICI / "_succes_icones.bin"
+    entree.write_text(json.dumps({"action": action, "noms": list(noms), "icones": icones,
+                                  "fichier_icones": str(fichier)}), encoding="utf-8")
+    sortie.unlink(missing_ok=True)
+    fichier.unlink(missing_ok=True)
+    env = dict(os.environ, SteamAppId=str(appid), SteamGameId=str(appid))
+    try:
+        subprocess.run(commande("--succes", str(appid), str(entree), str(sortie)),
+                       env=env, cwd=ICI, creationflags=SANS_FENETRE, timeout=120,
+                       stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        res = json.loads(sortie.read_text(encoding="utf-8"))
+        if res.get("icones") and fichier.exists():
+            res["_icones"] = fichier.read_bytes()
+    except (OSError, subprocess.TimeoutExpired, ValueError) as e:
+        res = {"erreur": "processus", "detail": repr(e)}
+    finally:
+        for p in (entree, sortie, fichier):
+            p.unlink(missing_ok=True)
+    if res.get("erreur"):
+        journal(T("[{a}] succès : {e} {d}", a=appid, e=res["erreur"], d=res.get("detail", "")))
+    return res
+
+
 # ───────────────────────── Petits outils ─────────────────────────
 
 def hms(s: float) -> str:
@@ -552,8 +757,9 @@ def objectif_txt(h: float) -> str:
     return heures(round(h * 60), None)
 
 
-def pct(p: int) -> str:
-    return f"{p}%" if LANGUE == "en" else f"{p} %"
+def pct(p: float) -> str:
+    """Pourcentage : « 9,5 % » (fr) ou « 9.5% » (en)."""
+    return f"{nombre_txt(p)}%" if LANGUE == "en" else f"{nombre_txt(p)} %"
 
 
 def jour_court(d) -> str:
@@ -562,6 +768,12 @@ def jour_court(d) -> str:
 
 def date_courte(d) -> str:
     return f"{MOIS_EN[d.month - 1]} {d.day}" if LANGUE == "en" else d.strftime("%d/%m")
+
+
+def date_longue(ts: float) -> str:
+    """Date d'un instant passé, avec l'année : « 15/11/2026 » / « Nov 15, 2026 »."""
+    d = dt.datetime.fromtimestamp(ts)
+    return f"{MOIS_EN[d.month - 1]} {d.day}, {d.year}" if LANGUE == "en" else d.strftime("%d/%m/%Y")
 
 
 def moment(ts: float) -> str:
@@ -652,6 +864,22 @@ def dessiner_logo(n: int):
     d.polygon([(a, t * .26), (b, t * .26), (m + t * .03, m), (b, t * .74), (a, t * .74), (m - t * .03, m)], fill=ACCENT)
     d.polygon([(a + t * .06, t * .30), (b - t * .06, t * .30), (m, t * .46)], fill="#1b2838")
     d.polygon([(m, t * .58), (b - t * .07, t * .70), (a + t * .07, t * .70)], fill="#1b2838")
+    return im.resize((n, n), Image.LANCZOS)
+
+
+def dessiner_trophee(n: int, couleur: str = OR):
+    """Petit trophée doré du bouton Succès."""
+    from PIL import Image, ImageDraw
+    t = n * 4
+    im = Image.new("RGBA", (t, t), (0, 0, 0, 0))
+    d = ImageDraw.Draw(im)
+    e = max(4, int(t * .085))
+    d.ellipse((t * .04, t * .12, t * .42, t * .50), outline=couleur, width=e)     # anses
+    d.ellipse((t * .58, t * .12, t * .96, t * .50), outline=couleur, width=e)
+    d.pieslice((t * .20, -t * .32, t * .80, t * .64), 0, 180, fill=couleur)     # coupe
+    d.rectangle((t * .20, t * .08, t * .80, t * .17), fill=couleur)
+    d.rectangle((t * .44, t * .60, t * .56, t * .78), fill=couleur)              # pied
+    d.rounded_rectangle((t * .26, t * .78, t * .74, t * .92), int(t * .04), fill=couleur)
     return im.resize((n, n), Image.LANCZOS)
 
 
@@ -767,7 +995,11 @@ def interface(auto: bool, apres=None) -> None:
             self.q: queue.Queue = queue.Queue()
             self.auto, self.steam_pret_depuis = auto, None
             self.tray, self.notifie = None, False
-            self.fen_stats = self.fen_options = None
+            self.fen_stats = self.fen_options = self.fen_succes = None
+            self.succes_jeu: int | None = None              # fenêtre Succès : jeu affiché
+            self.succes_liste: list[dict] = []
+            self.succes_icones: dict[str, Image.Image] = {}
+            self.succes_occupe = False                      # un processus --succes tourne
             self._rendu_prevu = None
             self._masque = None
             self._maj_objectif = False
@@ -782,8 +1014,12 @@ def interface(auto: bool, apres=None) -> None:
             self.si_inactif = tk.BooleanVar(value=c.get("si_inactif", False))
             self.inactif_min = tk.StringVar(value=str(c.get("inactif_min", "10")))
             self._style()
-            if c.get("langue") in ("fr", "en"):
-                LANGUE = c["langue"]
+            # la langue n'est demandée qu'une fois : config.json de ce dossier, sinon celle déjà choisie sur ce PC
+            langue = c.get("langue") if c.get("langue") in ("fr", "en") else langue_retenue()
+            if langue:
+                LANGUE = c["langue"] = langue
+                if langue_retenue() is None:     # choisie avant la v1.3 : la retenir aussi pour tout le PC
+                    retenir_langue(langue)
             elif auto:                       # démarrage caché : pas de question, langue de Windows
                 LANGUE = langue_systeme()
             else:
@@ -838,12 +1074,16 @@ def interface(auto: bool, apres=None) -> None:
             s.map("TButton", background=[("active", BORD)], foreground=[("disabled", GRIS)])
             s.configure("Accent.TButton", background=ACCENT, foreground=ENCRE,
                         font=("Segoe UI", 10, "bold"), padding=(18, 8))
-            s.map("Accent.TButton", background=[("active", ACCENT_CLAIR)])
+            s.map("Accent.TButton", background=[("disabled", PANNEAU), ("active", ACCENT_CLAIR)],
+                  foreground=[("disabled", GRIS)])
+            s.configure("Succes.Treeview", rowheight=int(54 * k))
             s.configure("Arret.TButton", background=ROUGE, foreground=ENCRE,
                         font=("Segoe UI", 10, "bold"), padding=(18, 8))
             s.map("Arret.TButton", background=[("active", "#f5a3a3")])
             s.configure("Verre.TButton", background="#262c36", foreground=TEXTE, padding=(14, 7))
             s.map("Verre.TButton", background=[("active", "#323a47")])
+            s.configure("Succes.TButton", background="#3a3220", foreground="#f6d987", padding=(12, 7))
+            s.map("Succes.TButton", background=[("active", "#4b412a")])
             s.configure("BanPetit.TButton", background="#323a47", foreground=TEXTE, padding=(8, 2))
             s.map("BanPetit.TButton", background=[("active", "#3d4655")])
             s.configure("TCheckbutton", background=FOND, foreground=DOUX, indicatorbackground=PANNEAU,
@@ -915,6 +1155,7 @@ def interface(auto: bool, apres=None) -> None:
             r.unbind("<Return>")
             LANGUE = choix.get() if choix.get() in ("fr", "en") else defaut
             self.cfg["langue"] = LANGUE
+            retenir_langue(LANGUE)
             f.destroy()
             r.resizable(True, True)
             r.minsize(*self._taille_min())
@@ -957,13 +1198,18 @@ def interface(auto: bool, apres=None) -> None:
             ttk.Label(obj, text=T("h de jeu au total"), style="Ban.TLabel").pack(side="left", padx=(6, 8))
             ttk.Button(obj, text=T("＋ X h…"), style="BanPetit.TButton",
                        command=lambda: self._encore_dialogue([self.sel])).pack(side="left")
+            self.b_obj = obj
             self.b_w_obj = self.ban.create_window(0, 0, anchor="sw", window=obj)
             self.b_farm = ttk.Button(self.ban, style="Accent.TButton", width=17, text=T("＋  Ajouter au farm"),
                                      command=self._basculer_selection)
             self.b_steam = ttk.Button(self.ban, text=T("Ouvrir dans Steam"), style="Verre.TButton",
                                       command=lambda: self._ouvrir("steam://nav/games/details/{}"))
+            self._trophee_tk = ImageTk.PhotoImage(dessiner_trophee(int(18 * k)))
+            self.b_succes = ttk.Button(self.ban, text=T("Succès"), image=self._trophee_tk, compound="left",
+                                       style="Succes.TButton", command=lambda: self._ouvrir_succes())
             self.b_w_farm = self.ban.create_window(0, 0, anchor="se", window=self.b_farm)
             self.b_w_steam = self.ban.create_window(0, 0, anchor="se", window=self.b_steam)
+            self.b_w_succes = self.ban.create_window(0, 0, anchor="se", window=self.b_succes)
 
             # recherche + filtre + groupes
             barre = ttk.Frame(r, padding=(m18, int(4 * k), m18, int(8 * k)))
@@ -1033,10 +1279,11 @@ def interface(auto: bool, apres=None) -> None:
                 return
             LANGUE = code
             self.cfg["langue"] = code
+            retenir_langue(code)
             sel = self.sel
             for w in self.r.winfo_children():
                 w.destroy()
-            self.fen_stats = self.fen_options = None
+            self.fen_stats = self.fen_options = self.fen_succes = None
             self.r.title(T("Farm d'heures Steam"))
             self._construire()
             if self.actif:
@@ -1055,15 +1302,16 @@ def interface(auto: bool, apres=None) -> None:
             self._ouvrir_options()
 
         # ── petites fenêtres ──
-        def _dialogue(self, titre: str, message: str, boutons, saisie: str | None = None):
+        def _dialogue(self, titre: str, message: str, boutons, saisie: str | None = None, parent=None):
             """Fenêtre modale sombre. Renvoie (index du bouton cliqué ou None, texte saisi)."""
             k = self.k
             if self.r.state() != "normal":     # fenêtre cachée (zone de notification) : la montrer d'abord
                 self._montrer()
-            d = tk.Toplevel(self.r)
+            parent = parent or self.r
+            d = tk.Toplevel(parent)
             d.title(titre)
             d.configure(bg=FOND)
-            d.transient(self.r)
+            d.transient(parent)
             d.resizable(False, False)
             f = ttk.Frame(d, padding=int(20 * k))
             f.pack(fill="both", expand=True)
@@ -1089,8 +1337,8 @@ def interface(auto: bool, apres=None) -> None:
                 d.bind("<Return>", lambda e: choisir(len(boutons) - 1))
             self._barre_sombre(d)
             d.update_idletasks()
-            x = self.r.winfo_rootx() + (self.r.winfo_width() - d.winfo_width()) // 2
-            y = self.r.winfo_rooty() + (self.r.winfo_height() - d.winfo_height()) // 3
+            x = parent.winfo_rootx() + (parent.winfo_width() - d.winfo_width()) // 2
+            y = parent.winfo_rooty() + (parent.winfo_height() - d.winfo_height()) // 3
             d.geometry(f"+{max(0, x)}+{max(0, y)}")
             d.grab_set()
             self.r.wait_window(d)
@@ -1335,6 +1583,262 @@ def interface(auto: bool, apres=None) -> None:
                 c.create_rectangle(nom_l, y - 6 * k, nom_l + larg, y + 6 * k, fill=BARRE, width=0)
                 c.create_text(nom_l + larg + int(8 * k), y, text=heures(v / 60), anchor="w", fill=DOUX,
                               font=("Segoe UI", 9))
+
+        # ── succès ──
+        # Lire les succès passe par un processus --succes qui se présente à Steam comme le jeu : Steam affiche
+        # « En jeu » quelques secondes. Rien n'est lu tant que l'utilisateur n'ouvre pas la fenêtre.
+        def _ouvrir_succes(self, a: int | None = None):
+            a = a or self.sel
+            if a not in self.jeux:
+                return
+            ancienne = self.fen_succes
+            if ancienne is not None and ancienne.winfo_exists():
+                if self.succes_jeu == a or self.succes_occupe:   # même jeu, ou une opération est en cours
+                    ancienne.deiconify()
+                    ancienne.lift()
+                    return
+                ancienne.destroy()
+            self.fen_succes = None
+            w = self._fenetre("fen_succes", T("Succès · {j}", j=self._nom(a)), (760, 700))
+            k = self.k
+            m18 = int(18 * k)
+            self.succes_jeu, self.succes_liste, self.succes_icones, self._succes_tk = a, [], {}, {}
+            haut = ttk.Frame(w, padding=(m18, int(16 * k), m18, int(4 * k)))
+            haut.pack(fill="x")
+            ttk.Label(haut, text=self._nom(a), style="Titre.TLabel").pack(anchor="w")
+            ligne = ttk.Frame(haut)
+            ligne.pack(fill="x", pady=(int(6 * k), 0))
+            self.s_resume = ttk.Label(ligne, style="Doux.TLabel")
+            self.s_resume.pack(side="left")
+            self.s_jauge = tk.Canvas(ligne, height=max(4, int(6 * k)), width=int(180 * k), bg=FOND,
+                                     highlightthickness=0)
+            self.s_jauge.pack(side="left", padx=(int(12 * k), 0))
+            outils = ttk.Frame(w, padding=(m18, int(10 * k), m18, int(8 * k)))
+            outils.pack(fill="x")
+            self.s_filtre = tk.StringVar(value=T(FILTRES_SUCCES[0][1]))
+            cb = ttk.Combobox(outils, textvariable=self.s_filtre, values=[T(l) for _, l in FILTRES_SUCCES],
+                              state="readonly", width=16)
+            cb.pack(side="left")
+            cb.bind("<<ComboboxSelected>>", lambda e: (self._remplir_succes(), self.s_arbre.focus_set()))
+            ttk.Button(outils, text=T("Tout sélectionner"), command=self._tout_selectionner_succes).pack(
+                side="left", padx=(10, 0))
+            self.s_recharger = ttk.Button(outils, text=T("↻  Recharger"), command=lambda: self._lancer_succes("lire"))
+            self.s_recharger.pack(side="right")
+            # pied (avant la liste, pour qu'il reste visible si la fenêtre rétrécit)
+            pied = ttk.Frame(w, padding=(m18, int(10 * k), m18, int(14 * k)))
+            pied.pack(side="bottom", fill="x")
+            self.s_debloquer = ttk.Button(pied, style="Accent.TButton", command=lambda: self._agir_succes("debloquer"))
+            self.s_debloquer.pack(side="right")
+            self.s_verrouiller = ttk.Button(pied, command=lambda: self._agir_succes("verrouiller"))
+            self.s_verrouiller.pack(side="right", padx=(0, 8))
+            self.s_etat = ttk.Label(pied, style="Doux.TLabel", wraplength=int(400 * k), justify="left")
+            self.s_etat.pack(side="left", fill="x", expand=True)
+            ttk.Frame(w, style="Ligne.TFrame", height=1).pack(side="bottom", fill="x", padx=m18)
+            milieu = ttk.Frame(w, padding=(m18, 0, m18, 0))
+            milieu.pack(fill="both", expand=True)
+            arbre = self.s_arbre = ttk.Treeview(milieu, columns=("etat", "pct"), show="tree headings",
+                                                selectmode="extended", style="Succes.Treeview")
+            arbre.heading("#0", text=T("Succès"), anchor="w")
+            arbre.column("#0", width=int(440 * k), stretch=True)
+            arbre.heading("etat", text=T("Débloqué le"), anchor="e")
+            arbre.column("etat", width=int(130 * k), anchor="e", stretch=False)
+            arbre.heading("pct", text=T("Joueurs"), anchor="e")
+            arbre.column("pct", width=int(80 * k), anchor="e", stretch=False)
+            sb = ttk.Scrollbar(milieu, orient="vertical", command=arbre.yview)
+            arbre.configure(yscrollcommand=sb.set)
+            arbre.pack(side="left", fill="both", expand=True)
+            sb.pack(side="right", fill="y")
+            arbre.tag_configure("verrou", foreground=DOUX)
+            arbre.bind("<<TreeviewSelect>>", lambda e: self._maj_boutons_succes())
+            arbre.bind("<Control-a>", lambda e: (self._tout_selectionner_succes(), "break")[1])
+            w.bind("<Escape>", lambda e: w.destroy())
+            self._maj_boutons_succes()
+            self._lancer_succes("lire")
+
+        def _maj_bouton_succes(self, variante: str = "compte"):
+            """Bouton de la bannière : « Succès 12/76 » si on a déjà lu les succès de ce jeu, « Succès » sinon,
+            ou le trophée seul (variante "icone") quand la place manque."""
+            if variante == "icone":
+                self.b_succes.config(text="", compound="image")
+                return
+            vu = self.cfg.get("succes_vus", {}).get(str(self.sel))
+            texte = T("Succès  {f}/{n}", f=vu[0], n=vu[1]) if variante == "compte" and vu and vu[1] else T("Succès")
+            self.b_succes.config(text=texte, compound="left")
+
+        def _succes_ouverte(self) -> bool:
+            w = self.fen_succes
+            return w is not None and w.winfo_exists()
+
+        def _etat_succes(self, texte: str, couleur: str = DOUX):
+            if self._succes_ouverte():
+                self.s_etat.config(text=texte, foreground=couleur)
+
+        def _lancer_succes(self, action: str, noms=()):
+            """Lit (ou débloque / re-verrouille) les succès du jeu de la fenêtre, dans un fil à part."""
+            a = self.succes_jeu
+            if self.succes_occupe or a is None:
+                return
+            if not steam_pret():
+                self._etat_succes(T("Ouvre Steam et connecte-toi pour voir les succès."), ORANGE)
+                return
+            self.succes_occupe = True
+            self._maj_boutons_succes()
+            self._etat_succes({"lire": T("Lecture des succès dans Steam…"),
+                               "debloquer": T("Déblocage en cours…"),
+                               "verrouiller": T("Re-verrouillage en cours…")}[action])
+            if not self.succes_liste:
+                self.s_resume.config(text=T("Chargement…"))
+            # pendant ce temps, le registre de Steam dit que le jeu tourne : ce n'est pas un vrai jeu lancé
+            self.arretes[a] = time.time()
+
+            def tache():
+                res = succes_steam(a, action, noms)
+                self.q.put(lambda: self._succes_recus(a, action, list(noms), res))
+            threading.Thread(target=tache, daemon=True).start()
+
+        def _succes_recus(self, a: int, action: str, noms: list[str], res: dict):
+            self.succes_occupe = False
+            self.arretes[a] = time.time()
+            if not self._succes_ouverte() or self.succes_jeu != a:
+                return
+            erreur = res.get("erreur")
+            if erreur:
+                textes = {"init": T("Steam a refusé d'ouvrir les succès de ce jeu ({d}).", d=res.get("detail", "")),
+                          "stats": T("Steam n'a pas envoyé tes succès. Réessaie dans un instant."),
+                          "dll": T("La DLL de Steam trouvée est trop ancienne pour lire les succès.")}
+                self._etat_succes(textes.get(erreur, T("Lecture impossible ({e}). Détails dans journal.txt.", e=erreur)),
+                                  ROUGE)
+                if not self.succes_liste:
+                    self.s_resume.config(text="")
+                self._maj_boutons_succes()
+                return
+            self.succes_liste = res.get("succes", [])
+            # compte gardé en config pour l'afficher sur le bouton de la bannière
+            self.cfg.setdefault("succes_vus", {})[str(a)] = [sum(x["fait"] for x in self.succes_liste),
+                                                             len(self.succes_liste)]
+            self._sauver()
+            if self.sel == a:
+                self._planifier_banniere()
+            self.succes_icones, self._succes_tk = {}, {}
+            blob = res.get("_icones", b"")
+            for ident, (debut, iw, ih) in res.get("icones", {}).items():
+                try:
+                    self.succes_icones[ident] = Image.frombytes("RGBA", (iw, ih), blob[debut:debut + iw * ih * 4])
+                except (ValueError, TypeError):
+                    pass
+            garder = set(self.s_arbre.selection())
+            self._remplir_succes()
+            garder = [i for i in garder if self.s_arbre.exists(i)]
+            if garder:
+                self.s_arbre.selection_set(garder)
+            if action == "lire":
+                self._etat_succes(T("Ce jeu n'a pas de succès Steam.") if not self.succes_liste else
+                                  T("Sélectionne des succès (Ctrl+clic ou Maj+clic pour en prendre plusieurs)."),
+                                  GRIS)
+                return
+            refuses = res.get("refuses", [])
+            faits = len(noms) - len(refuses)
+            if action == "debloquer":
+                texte = pluriel(faits, "{n} succès débloqué.", "{n} succès débloqués.")
+            else:
+                texte = pluriel(faits, "{n} succès re-verrouillé.", "{n} succès re-verrouillés.")
+            if refuses:
+                texte += " " + pluriel(len(refuses), "Steam en a refusé {n} : le jeu le protège.",
+                                       "Steam en a refusé {n} : le jeu les protège.")
+            self._etat_succes(texte, ORANGE if refuses else VERT)
+
+        def _remplir_succes(self):
+            arbre = self.s_arbre
+            arbre.delete(*arbre.get_children())
+            filtre = next((c for c, l in FILTRES_SUCCES if T(l) == self.s_filtre.get()), "tous")
+            for x in self.succes_liste:
+                if (filtre == "verrouilles" and x["fait"]) or (filtre == "debloques" and not x["fait"]):
+                    continue
+                desc = x["desc"] if len(x["desc"]) <= 72 else x["desc"][:70].rstrip() + "…"
+                if x["fait"]:
+                    etat = date_longue(x["date"]) if x["date"] else T("Débloqué")
+                else:
+                    etat = T("Caché") if x["cache"] else T("Verrouillé")
+                arbre.insert("", "end", iid=x["id"], text=f'{x["nom"]}\n{desc}' if desc else x["nom"],
+                             image=self._image_succes(x), values=(etat, pct(x["pct"]) if "pct" in x else ""),
+                             tags=() if x["fait"] else ("verrou",))
+            self._maj_resume_succes()
+            self._maj_boutons_succes()
+
+        def _image_succes(self, x: dict):
+            if x["id"] not in self._succes_tk:
+                k = self.k
+                s = int(40 * k)
+                im = self.succes_icones.get(x["id"])
+                im = arrondir(im.resize((s, s), Image.LANCZOS), 0.14) if im else icone_jeu(None, x["nom"], s)
+                cadre = Image.new("RGBA", (s + int(12 * k), s), (0, 0, 0, 0))   # marge avant le texte
+                cadre.alpha_composite(im)
+                self._succes_tk[x["id"]] = ImageTk.PhotoImage(cadre)
+            return self._succes_tk[x["id"]]
+
+        def _maj_resume_succes(self):
+            n, k = len(self.succes_liste), self.k
+            f = sum(x["fait"] for x in self.succes_liste)
+            c = self.s_jauge
+            c.delete("all")
+            if not n:
+                self.s_resume.config(text=T("Aucun succès"))
+                return
+            self.s_resume.config(text=T("{f} sur {n} débloqués", f=f, n=n) + "  ·  " + pct(int(100 * f / n)))
+            L, H = int(180 * k), max(4, int(6 * k))
+            c.create_rectangle(0, 0, L, H, fill="#323a47", width=0)
+            if f:
+                c.create_rectangle(0, 0, max(2, L * f / n), H, fill=VERT if f == n else ACCENT, width=0)
+
+        def _selection_succes(self) -> list[dict]:
+            par_id = {x["id"]: x for x in self.succes_liste}
+            return [par_id[i] for i in self.s_arbre.selection() if i in par_id]
+
+        def _maj_boutons_succes(self):
+            if not self._succes_ouverte():
+                return
+            sel = self._selection_succes()
+            n_deb, n_ver = sum(not x["fait"] for x in sel), sum(x["fait"] for x in sel)
+            occupe = self.succes_occupe
+            self.s_debloquer.config(text=T("Débloquer ({n})", n=n_deb) if n_deb else T("Débloquer"),
+                                    state="disabled" if occupe or not n_deb else "normal")
+            self.s_verrouiller.config(text=T("Re-verrouiller ({n})", n=n_ver) if n_ver else T("Re-verrouiller"),
+                                      state="disabled" if occupe or not n_ver else "normal")
+            self.s_recharger.config(state="disabled" if occupe else "normal")
+
+        def _tout_selectionner_succes(self):
+            self.s_arbre.selection_set(self.s_arbre.get_children())
+
+        def _agir_succes(self, action: str):
+            if self.succes_occupe:
+                return
+            debloquer = action == "debloquer"
+            cibles = [x["id"] for x in self._selection_succes() if x["fait"] != debloquer]
+            if not cibles:
+                return
+            jeu, n = self._nom(self.succes_jeu), len(cibles)
+            if debloquer:
+                texte = pluriel(n, "Débloquer {n} succès de {j} ?", "Débloquer les {n} succès de {j} ?", j=jeu)
+                texte += "\n\n" + T("Ils apparaîtront sur ton profil Steam avec la date d'aujourd'hui.")
+                if not self.cfg.get("succes_averti"):
+                    texte += "\n\n" + T("À savoir : ces succès comptent comme les autres sur ton profil. Des sites "
+                                        "de classement peuvent repérer ceux débloqués tous d'un coup, et les jeux en "
+                                        "ligne avec anti-triche ont parfois leurs propres règles. À tes risques.")
+                bouton = T("Débloquer")
+            else:
+                texte = pluriel(n, "Re-verrouiller {n} succès de {j} ?", "Re-verrouiller les {n} succès de {j} ?",
+                                j=jeu)
+                texte += "\n\n" + T("Leur date de déblocage sera perdue. Si tu les débloques à nouveau, ils auront "
+                                    "la date de ce jour-là.")
+                bouton = T("Re-verrouiller")
+            choix, _ = self._dialogue(T("Succès"), texte, [(T("Annuler"), "TButton"), (bouton, "Accent.TButton")],
+                                      parent=self.fen_succes)
+            if choix != 1 or not self._succes_ouverte():
+                return
+            if debloquer and not self.cfg.get("succes_averti"):
+                self.cfg["succes_averti"] = True
+                self._sauver()
+            self._lancer_succes(action, cibles)
 
         # ── zone de notification ──
         def _creer_tray(self):
@@ -1668,11 +2172,25 @@ def interface(auto: bool, apres=None) -> None:
             c.coords(self.b_w_obj, marge, yb)
             c.coords(self.b_w_farm, w - marge, yb)
             self.r.update_idletasks()
-            c.coords(self.b_w_steam, w - marge - self.b_farm.winfo_reqwidth() - int(10 * k), yb)
+            x_steam = w - marge - self.b_farm.winfo_reqwidth() - int(10 * k)
+            c.coords(self.b_w_steam, x_steam, yb)
+            x_succes = x_steam - self.b_steam.winfo_reqwidth() - int(10 * k)
+            c.coords(self.b_w_succes, x_succes, yb)
             self._geo_jauge = (marge, bas_logo + int(64 * k))
             vis = "normal" if a in self.jeux else "hidden"
             for item in (self.b_w_farm, self.b_w_steam, self.b_w_obj):
                 c.itemconfig(item, state=vis)
+            # fenêtre étroite : le bouton Succès rétrécit (sans le compte, puis trophée seul), et s'il ne tient
+            # toujours pas, il laisse la place à l'objectif (les succès restent dans le clic droit)
+            libre = x_succes - marge - self.b_obj.winfo_reqwidth() - int(12 * k)
+            place = False
+            for variante in ("compte", "texte", "icone"):
+                self._maj_bouton_succes(variante)
+                self.r.update_idletasks()
+                if self.b_succes.winfo_reqwidth() < libre:
+                    place = True
+                    break
+            c.itemconfig(self.b_w_succes, state=vis if place else "hidden")
             self._charger_objectif()
             self._maj_banniere_textes()
 
@@ -1886,6 +2404,7 @@ def interface(auto: bool, apres=None) -> None:
             m.add_command(label=T("Définir un objectif d'heures…"), command=lambda: self._objectif_dialogue(ids))
             m.add_command(label=T("Farmer encore quelques heures…"), command=lambda: self._encore_dialogue(ids))
             m.add_separator()
+            m.add_command(label=T("Succès…"), command=lambda: self._ouvrir_succes(a))
             m.add_command(label=T("Ouvrir dans la bibliothèque Steam"),
                           command=lambda: self._ouvrir("steam://nav/games/details/{}", a))
             m.add_command(label=T("Page du magasin"),
@@ -2630,7 +3149,60 @@ EN = {
     "  ·  {d}  ·  +{h} gagnées": "  ·  {d}  ·  +{h} gained",
     "  ·  arrêt dans {d}": "  ·  stops in {d}",
     "  ·  {n} refusé(s)": "  ·  {n} refused",
+    # succès
+    "Succès": "Achievements",
+    "Succès…": "Achievements…",
+    "Succès · {j}": "Achievements · {j}",
+    "Succès  {f}/{n}": "Achievements  {f}/{n}",
+    "Tous les succès": "All achievements",
+    "Verrouillés": "Locked",
+    "Débloqués": "Unlocked",
+    "Tout sélectionner": "Select all",
+    "Débloqué le": "Unlocked on",
+    "Joueurs": "Players",
+    "Débloqué": "Unlocked",
+    "Verrouillé": "Locked",
+    "Caché": "Hidden",
+    "Chargement…": "Loading…",
+    "Aucun succès": "No achievements",
+    "{f} sur {n} débloqués": "{f} of {n} unlocked",
+    "Débloquer": "Unlock",
+    "Débloquer ({n})": "Unlock ({n})",
+    "Re-verrouiller": "Relock",
+    "Re-verrouiller ({n})": "Relock ({n})",
+    "Ouvre Steam et connecte-toi pour voir les succès.": "Open Steam and sign in to see achievements.",
+    "Lecture des succès dans Steam…": "Reading achievements from Steam…",
+    "Déblocage en cours…": "Unlocking…",
+    "Re-verrouillage en cours…": "Relocking…",
+    "Steam a refusé d'ouvrir les succès de ce jeu ({d}).": "Steam refused to open this game's achievements ({d}).",
+    "Steam n'a pas envoyé tes succès. Réessaie dans un instant.":
+        "Steam didn't send your achievements. Try again in a moment.",
+    "La DLL de Steam trouvée est trop ancienne pour lire les succès.":
+        "The Steam DLL found is too old to read achievements.",
+    "Lecture impossible ({e}). Détails dans journal.txt.": "Couldn't read achievements ({e}). Details in journal.txt.",
+    "Ce jeu n'a pas de succès Steam.": "This game has no Steam achievements.",
+    "Sélectionne des succès (Ctrl+clic ou Maj+clic pour en prendre plusieurs).":
+        "Select achievements (Ctrl+click or Shift+click to pick several).",
+    "{n} succès débloqué.": "{n} achievement unlocked.",
+    "{n} succès débloqués.": "{n} achievements unlocked.",
+    "{n} succès re-verrouillé.": "{n} achievement relocked.",
+    "{n} succès re-verrouillés.": "{n} achievements relocked.",
+    "Steam en a refusé {n} : le jeu le protège.": "Steam refused {n}: the game protects it.",
+    "Steam en a refusé {n} : le jeu les protège.": "Steam refused {n}: the game protects them.",
+    "Débloquer {n} succès de {j} ?": "Unlock {n} achievement in {j}?",
+    "Débloquer les {n} succès de {j} ?": "Unlock {n} achievements in {j}?",
+    "Ils apparaîtront sur ton profil Steam avec la date d'aujourd'hui.":
+        "They will show on your Steam profile with today's date.",
+    "À savoir : ces succès comptent comme les autres sur ton profil. Des sites de classement peuvent repérer ceux "
+    "débloqués tous d'un coup, et les jeux en ligne avec anti-triche ont parfois leurs propres règles. À tes risques.":
+        "Good to know: these achievements count like any other on your profile. Ranking sites can spot ones "
+        "unlocked all at once, and online games with anti-cheat sometimes have their own rules. Use at your own risk.",
+    "Re-verrouiller {n} succès de {j} ?": "Relock {n} achievement in {j}?",
+    "Re-verrouiller les {n} succès de {j} ?": "Relock {n} achievements in {j}?",
+    "Leur date de déblocage sera perdue. Si tu les débloques à nouveau, ils auront la date de ce jour-là.":
+        "Their unlock date will be lost. If you unlock them again, they'll get that day's date.",
     # journal.txt
+    "[{a}] succès : {e} {d}": "[{a}] achievements: {e} {d}",
     "DLL copiée depuis {f}": "DLL copied from {f}",
     "SteamAPI_Init a échoué": "SteamAPI_Init failed",
     "[{a}] Steam a refusé : {m}": "[{a}] Steam refused: {m}",
@@ -2652,6 +3224,8 @@ def main():
         sys.exit(mode_farm(int(args[1]), int(args[2])))
     if args[:1] == ["--verif"]:
         sys.exit(mode_verif(Path(args[1]), Path(args[2])))
+    if args[:1] == ["--succes"]:
+        sys.exit(mode_succes(int(args[1]), Path(args[2]), Path(args[3])))
     if deja_ouvert():
         SIGNAL.touch()
         return

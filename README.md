@@ -18,12 +18,15 @@ A small Windows app that idles your Steam games: Steam thinks the game is runnin
 - **Refund warning:** a game bought less than 14 days ago with less than 2 hours played triggers a prompt. You can skip it, idle it up to 1 h 50, or idle it anyway.
 - **Statistics:** hours idled per day over the last 30 days, and your most idled games.
 - **Groups:** save the games you checked under a name and check them all again in one click.
+- **Achievements:** the gold **Achievements** button in the banner (or a right-click on a game) shows the game's achievements with their icons, unlock dates and how many players have them. You can unlock the ones you select, or lock them again (see "Good to know"). Once you've opened it for a game, the button shows how many you've unlocked.
 - Can stop after a set number of hours, and can keep the PC from going to sleep.
 - Keeps running in the system tray when you close the window.
 - Can start with Windows: it opens hidden and starts idling the games you checked once Steam is logged in.
 - Search, filters (checked, running, with a goal, refundable, never played, installed) and a right-click menu.
 
 ![Statistics window (demo data)](docs/stats-en.png)
+
+![Achievements window (demo data)](docs/succes-en.png)
 
 ## Install
 
@@ -66,6 +69,8 @@ The refund warning uses the purchase date that the Steam client reports for each
 
 A real game is spotted through the "running" flag Steam keeps for each game in the Windows registry. Invisible mode uses Steam's own `steam://friends/status/invisible` link, and reads your previous status from Steam's local settings.
 
+The Achievements window starts the same kind of background process for a few seconds and uses Steam's own achievement calls (`ISteamUserStats`): it reads the list, then `SetAchievement` or `ClearAchievement` and `StoreStats` when you unlock or lock achievements. Nothing is read until you open the window.
+
 ## Good to know
 
 - **Steam counts real time.** One hour of idling adds one hour to each idled game. Nothing can speed that up, but you can idle several games at once.
@@ -73,8 +78,9 @@ A real game is spotted through the "running" flag Steam keeps for each game in t
 - Your friends will see you as "In game", unless you turn on invisible mode in Options.
 - Games idled by another tool (ArchiSteamFarm, for example) look like real games to the app, so it pauses. If you use both, turn off "Pause farming when I launch a real game" in Options.
 - Each idled game uses about 55 MB of RAM, mostly Steam's own client library.
+- **Achievements:** an unlocked achievement shows on your profile like any other, with the date you unlocked it, and your friends may see it in their activity feed. Ranking sites can spot achievements unlocked all at once, and some games protect theirs (Steam then refuses the change and the app tells you). Opening the window shows you "In game" for a few seconds.
 - Many players idle games with tools like Idle Master or ArchiSteamFarm, but Valve doesn't officially endorse it. Use this app at your own risk.
-- The app keeps your settings, checked games, goals, groups and statistics in `config.json`, and errors in `journal.txt`, next to `farm.py` or `SteamHoursFarm.exe`. These files stay on your PC. To update, replace the program files and keep `config.json`.
+- The app keeps your settings, checked games, goals, groups and statistics in `config.json`, and errors in `journal.txt`, next to `farm.py` or `SteamHoursFarm.exe`. These files stay on your PC. To update, replace the program files and keep `config.json`. The language you pick is also remembered in the registry (`HKEY_CURRENT_USER\Software\FarmHeuresSteam`), so a new version unzipped somewhere else doesn't ask again.
 - This project is not affiliated with Valve or Steam.
 
 ---
@@ -110,16 +116,20 @@ Dans tous les cas, il faut Steam ouvert et connecté, et au moins un jeu Steam i
 - **Alerte remboursement :** pour un jeu acheté il y a moins de 14 jours et joué moins de 2 h, l'appli te demande quoi faire : ne pas le farmer, le farmer jusqu'à 1 h 50 ou le farmer quand même.
 - **Statistiques :** heures farmées par jour sur 30 jours et jeux les plus farmés.
 - **Groupes :** enregistre les jeux cochés sous un nom et recoche-les en un clic.
+- **Succès :** bouton doré **Succès** dans la bannière, ou clic droit sur un jeu. Tu vois les succès du jeu avec leur icône, leur date de déblocage et la part des joueurs qui les ont. Tu peux débloquer ceux que tu sélectionnes, ou les re-verrouiller. Une fois la fenêtre ouverte pour un jeu, le bouton affiche combien tu en as débloqué.
 - **Options :** arrêt automatique après X heures, PC gardé éveillé, lancement avec Windows, langue, ajout d'un jeu par son AppID.
 
 ![Statistiques (données de démo)](docs/stats.png)
+
+![Succès (données de démo)](docs/succes.png)
 
 **À savoir :**
 
 - 1 h de farm donne 1 h sur chaque jeu farmé. On peut farmer jusqu'à 32 jeux en même temps.
 - Au-delà de 2 h de jeu, Steam ne rembourse plus le jeu.
+- Un succès débloqué avec l'appli apparaît sur ton profil comme les autres, avec la date du déblocage, et tes amis peuvent le voir dans leur fil d'activité. Des sites de classement repèrent les succès débloqués tous d'un coup, et certains jeux protègent les leurs : Steam refuse alors le changement et l'appli te le dit. Ouvrir la fenêtre Succès te met « En jeu » quelques secondes.
 - Un jeu farmé par un autre outil (ArchiSteamFarm par exemple) compte comme un vrai jeu et met le farm en pause. Si tu utilises les deux, décoche « Mettre le farm en pause quand je lance un vrai jeu » dans **Options**.
-- Pour mettre à jour l'appli, remplace les fichiers du programme et garde `config.json` : il contient tes réglages, tes jeux cochés, tes objectifs, tes groupes et tes statistiques.
+- Pour mettre à jour l'appli, remplace les fichiers du programme et garde `config.json` : il contient tes réglages, tes jeux cochés, tes objectifs, tes groupes et tes statistiques. La langue choisie est aussi retenue dans le registre (`HKEY_CURRENT_USER\Software\FarmHeuresSteam`) : une nouvelle version dézippée ailleurs ne la redemande pas.
 - Valve n'autorise pas officiellement cette pratique : c'est à tes risques.
 
 ## License
