@@ -22,6 +22,7 @@ import json
 import math
 import os
 import queue
+import random
 import re
 import shutil
 import struct
@@ -38,7 +39,7 @@ from pathlib import Path
 # les processus de farm restent ainsi très légers.
 
 NOM = "Automata"                  # nom affiché de l'appli
-VERSION = "1.5.0"
+VERSION = "1.6.0"
 PROJET = "https://github.com/Dekeur/Automata-steam-plugins"
 MAJ_API = "https://api.github.com/repos/Dekeur/Automata-steam-plugins/releases/latest"
 GELE = getattr(sys, "frozen", False)          # True dans le .exe construit avec PyInstaller
@@ -55,6 +56,7 @@ NOM_RUN = "FarmHeuresSteam"
 CLE_APPLI = r"Software\FarmHeuresSteam"   # langue retenue pour tout le PC (valeur « Langue »)
 MAX_SIMULTANES = 32               # Steam refuse au-delà de 32 jeux lancés en même temps
 APP_TEST = 480                    # Spacewar, gratuit pour tous : sert à interroger Steam
+APP_REDIST = 228980               # « Steamworks Common Redistributables » : installé par Steam, pas un jeu
 SANS_FENETRE = 0x08000000         # CREATE_NO_WINDOW
 REMB_JOURS, REMB_SECONDES = 14, 2 * 3600   # règle de remboursement de Steam
 OBJECTIF_REMB = 110 / 60          # « farmer jusqu'à 1 h 50 » pour garder le remboursement
@@ -77,6 +79,19 @@ FILTRES = (("tous", "Tous les jeux"), ("coches", "Cochés"), ("encours", "En cou
            ("presque", "Succès presque finis"))
 PRESQUE = 0.8                     # filtre « Succès presque finis » : au moins 80 % des succès, sans les avoir tous
 FILTRES_SUCCES = (("tous", "Tous les succès"), ("verrouilles", "Verrouillés"), ("debloques", "Débloqués"))
+FILTRES_VALEUR = (("tous", "Tous les jeux payants"), ("jamais", "Jamais lancés"), ("promo", "En promo en ce moment"))
+HASARD = (("jamais", "Jamais lancés"), ("peu", "Joués moins de 2 h"), ("installes", "Installés"),
+          ("tous", "Tous mes jeux"))
+# menu Outils : boutique Steam (prix, noms) et liste de souhaits. Ces adresses ne reçoivent que des numéros de jeux,
+# sauf la liste de souhaits, qui reçoit l'identifiant public du compte.
+BOUTIQUE = "https://store.steampowered.com/api/appdetails"
+API_ARTICLES = "https://api.steampowered.com/IStoreBrowseService/GetItems/v1/"
+API_SOUHAITS = "https://api.steampowered.com/IWishlistService/GetWishlist/v1/"
+LOT_PRIX = 400                    # jeux par requête de prix (la boutique en accepte plus de 500)
+GRATUIT = "gratuit"               # prix_steam : jeu sans prix dans la boutique
+MAX_CAPTURES = 240                # vignettes affichées par jeu dans la fenêtre Captures d'écran
+SYMBOLES = {"EUR": "€", "USD": "$", "GBP": "£", "JPY": "¥", "CNY": "¥", "KRW": "₩", "INR": "₹", "UAH": "₴",
+            "PLN": "zł", "BRL": "R$", "CAD": "CA$", "AUD": "A$", "RUB": "₽", "TRY": "₺"}
 JOURS = {"fr": ("lun.", "mar.", "mer.", "jeu.", "ven.", "sam.", "dim."),
          "en": ("Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun")}
 MOIS_EN = ("Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec")
@@ -361,8 +376,8 @@ def bibliotheques(steam: Path) -> list[Path]:
     return [p for p in libs if p.exists()]
 
 
-def temps_de_jeu(steam: Path) -> dict[int, int]:
-    """appid -> minutes jouées, d'après le localconfig.vdf du compte connecté."""
+def apps_locales(steam: Path) -> dict:
+    """Section « apps » du localconfig.vdf du compte connecté (temps de jeu, dernier lancement…)."""
     uid = utilisateur_actif()
     dossiers = [steam / "userdata" / str(uid)] if uid else []
     if (steam / "userdata").exists():
@@ -370,11 +385,16 @@ def temps_de_jeu(steam: Path) -> dict[int, int]:
     for d in dossiers:
         f = d / "config" / "localconfig.vdf"
         if f.exists():
-            apps = lire_vdf(f).get("userlocalconfigstore", {}).get("software", {}) \
+            return lire_vdf(f).get("userlocalconfigstore", {}).get("software", {}) \
                 .get("valve", {}).get("steam", {}).get("apps", {})
-            return {int(k): int(v.get("playtime", "0") or 0)
-                    for k, v in apps.items() if k.isdigit() and isinstance(v, dict)}
     return {}
+
+
+def temps_de_jeu(steam: Path, apps: dict | None = None) -> dict[int, int]:
+    """appid -> minutes jouées, d'après le localconfig.vdf du compte connecté."""
+    apps = apps_locales(steam) if apps is None else apps
+    return {int(k): int(v.get("playtime", "0") or 0)
+            for k, v in apps.items() if k.isdigit() and isinstance(v, dict)}
 
 
 def lire_kv_binaire(data: bytes, p: int = 0, chaines: list[str] | None = None) -> tuple[dict, int]:
@@ -839,6 +859,228 @@ def succes_steam(appid: int, action: str = "lire", noms=(), icones: bool = True)
 
 # ───────────────────────── Petits outils ─────────────────────────
 
+# ───────────────────────── Outils Steam : données locales et boutique ─────────────────────────
+
+def collections_steam(steam: Path, uid: int) -> list[tuple[str, str, set[int]]]:
+    """Collections classiques de la bibliothèque Steam : (identifiant, nom, jeux), lues dans la copie locale du
+    stockage cloud de Steam. Les collections dynamiques (Steam les calcule lui-même à partir de filtres, parfois
+    d'après les jeux de tes amis) et « Masqués » sont laissées de côté, comme les collections vides."""
+    fichier = steam / "userdata" / str(uid) / "config" / "cloudstorage" / "cloud-storage-namespace-1.json"
+    out: list[tuple[str, str, set[int]]] = []
+    try:
+        entrees = json.loads(fichier.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return out
+    for e in entrees if isinstance(entrees, list) else []:
+        try:
+            cle, v = e
+            if not str(cle).startswith("user-collections.") or v.get("is_deleted") or not v.get("value"):
+                continue
+            c = json.loads(v["value"])
+            ident, nom = str(c.get("id", "")), str(c.get("name") or "").strip()
+            if "filterSpec" in c or ident == "hidden":
+                continue
+            jeux = {int(a) for a in c.get("added", []) if str(a).isdigit()}
+            if jeux and (nom or ident == "favorite"):
+                out.append((ident, nom, jeux))
+        except (ValueError, TypeError, AttributeError):
+            continue
+    return sorted(out, key=lambda c: (c[0] != "favorite", c[1].lower()))
+
+
+def captures_steam(steam: Path, uid: int) -> dict[int, list[Path]]:
+    """appid -> captures d'écran Steam du compte (touche F12 en jeu), les plus récentes d'abord."""
+    racine = steam / "userdata" / str(uid) / "760" / "remote"
+    out: dict[int, list[Path]] = {}
+    if not uid or not racine.is_dir():
+        return out
+    for d in racine.iterdir():
+        dossier = d / "screenshots"
+        if not d.name.isdigit() or not dossier.is_dir():
+            continue
+        try:
+            fichiers = sorted((p for p in dossier.iterdir()
+                               if p.suffix.lower() in (".jpg", ".jpeg", ".png") and p.is_file()),
+                              key=lambda p: p.name, reverse=True)
+        except OSError:
+            continue
+        if fichiers:
+            out[int(d.name)] = fichiers
+    return out
+
+
+def date_capture(p: Path) -> float:
+    """Instant d'une capture : Steam la nomme AAAAMMJJHHMMSS_n.jpg ; sinon, la date du fichier."""
+    m = re.match(r"(\d{14})", p.name)
+    try:
+        if m:
+            return dt.datetime.strptime(m[1], "%Y%m%d%H%M%S").timestamp()
+        return p.stat().st_mtime
+    except (ValueError, OSError, OverflowError):
+        return 0.0
+
+
+def jeux_installes(steam: Path) -> dict[int, dict]:
+    """appid -> {"nom", "taille" (octets), "lance" (dernier lancement), "disque"} d'après les appmanifest_*.acf
+    de chaque bibliothèque Steam."""
+    out: dict[int, dict] = {}
+    for lib in bibliotheques(steam):
+        for f in (lib / "steamapps").glob("appmanifest_*.acf"):
+            if not f.stem[12:].isdigit():
+                continue
+            try:
+                d = lire_vdf(f).get("appstate", {})
+            except OSError:
+                d = {}
+
+            def n(cle: str) -> int:
+                v = str(d.get(cle, ""))
+                return int(v) if v.isdigit() else 0
+
+            out[int(f.stem[12:])] = {"nom": str(d.get("name", "")), "taille": n("sizeondisk"),
+                                     "lance": n("lastplayed"), "disque": (lib.anchor or str(lib)).upper()}
+    return out
+
+
+def derniers_lancements(apps: dict) -> dict[int, int]:
+    """appid -> instant du dernier lancement (jeux installés ou non), d'après le localconfig.vdf du compte."""
+    out = {}
+    for k, v in apps.items():
+        if k.isdigit() and isinstance(v, dict) and str(v.get("lastplayed", "")).isdigit() and int(v["lastplayed"]):
+            out[int(k)] = int(v["lastplayed"])
+    return out
+
+
+def requete_json(url: str, delai: float = 20):
+    """GET d'une adresse publique de Steam -> JSON décodé, ou None sans réponse. La requête ne porte que l'adresse
+    et un User-Agent générique : aucun cookie, aucune session Steam."""
+    import urllib.request
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "SteamHoursFarm", "Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=delai) as rep:
+            return json.loads(rep.read(30_000_000).decode("utf-8"))
+    except Exception:  # noqa: BLE001 — pas de réseau, Steam indisponible… : l'appelant affiche un message
+        return None
+
+
+def prix_steam(ids) -> dict | None:
+    """Prix du moment dans la boutique Steam : appid -> (devise, prix normal, prix actuel) en centimes, GRATUIT
+    pour un jeu sans prix (gratuit ou pas encore sorti), None pour un jeu retiré de la boutique. Renvoie None si
+    la boutique ne répond pas. Elle ne reçoit que des numéros de jeux ; la devise est celle du pays d'où part
+    la requête."""
+    ids = sorted(set(ids))
+    out: dict = {}
+    for i in range(0, len(ids), LOT_PRIX):
+        lot = ids[i:i + LOT_PRIX]
+        d = requete_json(BOUTIQUE + "?filters=price_overview&appids=" + ",".join(map(str, lot)))
+        if not isinstance(d, dict):
+            return None
+        for a in lot:
+            x = d.get(str(a))
+            if not isinstance(x, dict) or not x.get("success"):
+                out[a] = None
+                continue
+            p = x.get("data")
+            p = p.get("price_overview") if isinstance(p, dict) else None
+            if isinstance(p, dict) and isinstance(p.get("final"), int):
+                out[a] = (str(p.get("currency", "")), int(p.get("initial") or p["final"]), int(p["final"]))
+            else:
+                out[a] = GRATUIT
+    return out
+
+
+def noms_boutique(ids, langue: str) -> dict[int, str]:
+    """Noms de jeux demandés à la boutique Steam, pour ceux que le cache local ne connaît pas (jeux de la liste
+    de souhaits que tu ne possèdes pas)."""
+    import urllib.parse
+    ids, out = sorted(set(ids)), {}
+    for i in range(0, len(ids), 100):
+        q = {"ids": [{"appid": a} for a in ids[i:i + 100]],
+             "context": {"language": "french" if langue == "fr" else "english", "country_code": "US"},
+             "data_request": {"include_basic_info": True}}
+        d = requete_json(API_ARTICLES + "?input_json=" + urllib.parse.quote(json.dumps(q, separators=(",", ":"))))
+        articles = d.get("response", {}).get("store_items", []) if isinstance(d, dict) else []
+        for x in articles if isinstance(articles, list) else []:
+            if isinstance(x, dict) and x.get("name") and str(x.get("appid", "")).isdigit() and int(x["appid"]):
+                out[int(x["appid"])] = str(x["name"])
+    return out
+
+
+def liste_souhaits(uid: int) -> list[int] | None:
+    """Jeux de la liste de souhaits du compte : None si Steam ne répond pas, liste vide si elle est vide ou privée.
+    Steam reçoit l'identifiant public du compte (SteamID) : la liste n'est lisible que si les « Détails du jeu »
+    du profil sont publics."""
+    if not uid:
+        return None
+    d = requete_json(f"{API_SOUHAITS}?steamid={76561197960265728 + uid}")
+    if not isinstance(d, dict) or not isinstance(d.get("response"), dict):
+        return None
+    articles = d["response"].get("items", [])
+    return [int(x["appid"]) for x in articles if isinstance(x, dict) and str(x.get("appid", "")).isdigit()]
+
+
+def souhaits_steam(uid: int, noms: dict[int, str], langue: str) -> list[dict] | None:
+    """Liste de souhaits avec les prix du moment : [{"a", "nom", "prix"}] (prix comme dans prix_steam).
+    None si Steam ne répond pas."""
+    ids = liste_souhaits(uid)
+    if ids is None:
+        return None
+    if not ids:
+        return []
+    prix = prix_steam(ids)
+    if prix is None:
+        return None
+    manquants = [a for a in ids if a not in noms]
+    autres = noms_boutique(manquants, langue) if manquants else {}
+    return [{"a": a, "nom": noms.get(a) or autres.get(a) or f"App {a}", "prix": prix.get(a)} for a in ids]
+
+
+def remise(p) -> int:
+    """Pourcentage de promo d'un prix (devise, normal, actuel) ; 0 sans promo ou sans prix."""
+    if not isinstance(p, tuple) or p[1] <= 0 or p[2] >= p[1]:
+        return 0
+    return round(100 - 100 * p[2] / p[1])
+
+
+def argent(centimes: float, devise: str) -> str:
+    """Somme lisible : « 1 234,56 € » (fr) / « €1,234.56 » (en). Une devise sans symbole connu garde son code."""
+    v = f"{centimes / 100:,.2f}"
+    sym = SYMBOLES.get(devise)
+    if LANGUE == "en":
+        return f"{sym}{v}" if sym else f"{v} {devise}".strip()
+    return f"{v.replace(',', ' ').replace('.', ',')} {sym or devise}".strip()
+
+
+def taille_txt(octets: float) -> str:
+    """Taille lisible : « 95,4 Go » (fr) / « 95.4 GB » (en)."""
+    unites = ("B", "KB", "MB", "GB", "TB") if LANGUE == "en" else ("o", "Ko", "Mo", "Go", "To")
+    v, i = float(octets), 0
+    while v >= 1024 and i < len(unites) - 1:
+        v, i = v / 1024, i + 1
+    txt = f"{v:.0f}" if i < 2 or v >= 100 else f"{v:.1f}"
+    return f"{txt if LANGUE == 'en' else txt.replace('.', ',')} {unites[i]}"
+
+
+def depuis_txt(ts: float) -> str:
+    """Ancienneté d'un instant passé : « aujourd'hui », « hier », « il y a 12 jours », « il y a 3 mois »,
+    « il y a 2 ans » ; « jamais » pour 0."""
+    if not ts:
+        return T("jamais")
+    try:
+        jours = (dt.date.today() - dt.date.fromtimestamp(ts)).days
+    except (ValueError, OSError, OverflowError):
+        return T("jamais")
+    if jours <= 0:
+        return T("aujourd'hui")
+    if jours == 1:
+        return T("hier")
+    if jours < 60:
+        return T("il y a {n} jours", n=jours)
+    if jours < 730:
+        return T("il y a {n} mois", n=jours // 30)
+    return T("il y a {n} ans", n=jours // 365)
+
+
 def heure_plage(texte: str) -> int:
     """Heure saisie dans Options (0 à 23) ; une saisie invalide vaut 0."""
     v = nombre(texte)
@@ -1147,6 +1389,23 @@ def interface(auto: bool, apres=None) -> None:
             self.auto, self.steam_pret_depuis = auto, None
             self.tray, self.notifie = None, False
             self.fen_stats = self.fen_options = self.fen_succes = None
+            self.fen_valeur = self.fen_stockage = self.fen_souhaits = self.fen_captures = self.fen_hasard = None
+            # menu Outils : données lues dans les fichiers de Steam, prix de la boutique, liste de souhaits
+            self.installations: dict[int, dict] = {}        # jeux installés : nom, taille, dernier lancement, disque
+            self.lances: dict[int, int] = {}                # appid -> instant du dernier lancement
+            self.collections: list[tuple[str, str, set[int]]] = []
+            self.captures: dict[int, list[Path]] = {}
+            self.prix: dict | None = None                   # prix de la boutique, gardés une heure
+            self.prix_date, self.prix_occupe = 0.0, False
+            self.souhaits: list[dict] | None = None
+            self.souhaits_date, self.souhaits_occupe = 0.0, False
+            self.tables: dict[str, tuple] = {}
+            self.tris_outils = {"valeur": ("prix", True), "stockage": ("taille", True), "souhaits": ("promo", True)}
+            self.h_jeu: int | None = None                   # « À quoi je joue ? » : jeu tiré
+            self.c_jeu: int | None = None                   # fenêtre Captures : jeu affiché
+            self.c_gen, self.c_cases, self.c_tk, self.c_ids = 0, [], {}, []
+            self._icones_tk: dict[int, ImageTk.PhotoImage] = {}
+            self._derniere_veille = time.time()
             self.succes_jeu: int | None = None              # fenêtre Succès : jeu affiché
             self.succes_liste: list[dict] = []
             self.succes_icones: dict[str, Image.Image] = {}
@@ -1168,6 +1427,7 @@ def interface(auto: bool, apres=None) -> None:
             self.plage = tk.BooleanVar(value=c.get("plage", False))
             self.plage_debut = tk.StringVar(value=str(c.get("plage_debut", "23")))
             self.plage_fin = tk.StringVar(value=str(c.get("plage_fin", "8")))
+            self.promos_auto = tk.BooleanVar(value=c.get("promos_auto", False))
             self._style()
             # la langue n'est demandée qu'une fois : config.json de ce dossier, sinon celle déjà choisie sur ce PC
             langue = c.get("langue") if c.get("langue") in ("fr", "en") else langue_retenue()
@@ -1187,6 +1447,7 @@ def interface(auto: bool, apres=None) -> None:
             r.after(150, self._pomper)
             r.after(500, self._tic)
             r.after(4000, self._verifier_maj)
+            r.after(9000, self._verifier_promos)
             if auto:
                 r.withdraw()
 
@@ -1346,14 +1607,18 @@ def interface(auto: bool, apres=None) -> None:
             self._logo_haut = ImageTk.PhotoImage(dessiner_logo(int(26 * k)))
             ttk.Label(haut, image=self._logo_haut).pack(side="left", padx=(0, int(8 * k)))
             ttk.Label(haut, text=NOM, style="Titre.TLabel").pack(side="left")
-            self.sous_titre = ttk.Label(haut, style="Gris.TLabel")
-            self.sous_titre.pack(side="left", padx=(14, 0), pady=(3, 0))
             ttk.Button(haut, text=T("↻  Recharger"), command=self._recharger).pack(side="right")
             ttk.Button(haut, text=T("Options"), command=self._ouvrir_options).pack(side="right", padx=(0, 8))
             ttk.Button(haut, text=T("Statistiques"), command=self._ouvrir_stats).pack(side="right", padx=(0, 8))
-            # « Nouvelle version x.y.z » : affichée par _montrer_maj seulement s'il y en a une
+            self.b_outils = ttk.Button(haut, text=T("Outils  ▾"), command=self._menu_outils)
+            self.b_outils.pack(side="right", padx=(0, 8))
+            # « Nouvelle version x.y.z » : vide tant qu'il n'y en a pas (rempli par _montrer_maj)
             self.l_maj = ttk.Label(haut, style="Lien.TLabel", cursor="hand2")
+            self.l_maj.pack(side="right", pady=(3, 0))
             self.l_maj.bind("<Button-1>", lambda e: os.startfile(PROJET + "/releases/latest"))
+            # placé en dernier : si la fenêtre est étroite, c'est le sous-titre qui est rogné, pas les boutons
+            self.sous_titre = ttk.Label(haut, style="Gris.TLabel")
+            self.sous_titre.pack(side="left", padx=(14, 0), pady=(3, 0))
 
             # bannière du jeu sélectionné
             self.ban = tk.Canvas(r, height=int(250 * k), bg=FOND, highlightthickness=0, bd=0)
@@ -1400,8 +1665,9 @@ def interface(auto: bool, apres=None) -> None:
             self.champ = ttk.Entry(barre, textvariable=self.recherche)
             self.champ.pack(side="left", fill="x", expand=True)
             self.filtre = tk.StringVar(value=T(FILTRES[0][1]))
-            cb = ttk.Combobox(barre, textvariable=self.filtre, values=[T(l) for _, l in FILTRES],
-                              state="readonly", width=max(15, max(len(T(l)) for _, l in FILTRES) + 1))
+            valeurs = self._valeurs_filtre()                 # filtres + collections Steam
+            cb = self.cb_filtre = ttk.Combobox(barre, textvariable=self.filtre, values=valeurs, state="readonly",
+                                               width=max(15, max(map(len, valeurs)) + 1))
             cb.pack(side="left", padx=(10, 0))
             cb.bind("<<ComboboxSelected>>", lambda e: (self._remplir(), self.arbre.focus_set()))
             self.b_groupes = ttk.Button(barre, text=T("Groupes  ▾"), command=self._menu_groupes)
@@ -1452,6 +1718,7 @@ def interface(auto: bool, apres=None) -> None:
                                 disabledforeground=GRIS)
             self.menu = tk.Menu(r, **options_menu)
             self.menu_sup = tk.Menu(self.menu, **options_menu)
+            self.menu_col = tk.Menu(self.menu, **options_menu)
 
         def _changer_langue(self, code: str):
             """Reconstruit toute la fenêtre dans l'autre langue, sans arrêter le farm."""
@@ -1465,6 +1732,7 @@ def interface(auto: bool, apres=None) -> None:
             for w in self.r.winfo_children():
                 w.destroy()
             self.fen_stats = self.fen_options = self.fen_succes = None
+            self.fen_valeur = self.fen_stockage = self.fen_souhaits = self.fen_captures = self.fen_hasard = None
             self.r.title(NOM)
             self._construire()
             if self.actif:
@@ -2059,6 +2327,692 @@ def interface(auto: bool, apres=None) -> None:
                 journal(T("icône de notification impossible : {e}", e=repr(e)))
                 self.tray = None
 
+        # ───────────── Outils Steam (menu Outils) ─────────────
+        def _menu_outils(self):
+            m = self.menu
+            m.delete(0, "end")
+            m.add_command(label=T("Valeur de la bibliothèque…"), command=self._ouvrir_valeur)
+            m.add_command(label=T("Stockage des jeux installés…"), command=self._ouvrir_stockage)
+            m.add_command(label=T("Promos de ma liste de souhaits…"), command=self._ouvrir_souhaits)
+            m.add_command(label=T("Captures d'écran…"), command=self._ouvrir_captures)
+            m.add_separator()
+            m.add_command(label=T("À quoi je joue ?…"), command=self._ouvrir_hasard)
+            b = self.b_outils
+            m.tk_popup(b.winfo_rootx(), b.winfo_rooty() + b.winfo_height())
+
+        def _ouverte(self, attr: str) -> bool:
+            w = getattr(self, attr, None)
+            return w is not None and bool(w.winfo_exists())
+
+        def _ouvrir_lien(self, cible: str):
+            try:
+                os.startfile(cible)
+            except OSError as e:
+                self.etat.config(text=T("Impossible d'ouvrir : {e}", e=e))
+
+        def _magasin_ligne(self, arbre, e):
+            ligne = arbre.identify_row(e.y)
+            if ligne:
+                self._ouvrir("https://store.steampowered.com/app/{}", int(ligne))
+
+        def _icone_tk(self, a: int, nom: str):
+            """Icône d'un jeu pour les listes des fenêtres Outils (aussi pour un jeu absent de la liste principale)."""
+            if a not in self._icones_tk:
+                s = int(24 * self.k)
+                if a not in self.icones:
+                    ch = self._chemins(a) if a in self.jeux else (chemins_images(self.steam, a) if self.steam else {})
+                    self.icones[a] = icone_jeu(ch.get("icone"), nom, s)
+                im = Image.new("RGBA", (s + int(10 * self.k), s), (0, 0, 0, 0))
+                im.alpha_composite(self.icones[a], (0, 0))
+                self._icones_tk[a] = ImageTk.PhotoImage(im)
+            return self._icones_tk[a]
+
+        def _tuiles(self, parent, titres) -> dict:
+            """Rangée de tuiles (titre, grande valeur, petite note), comme dans Statistiques."""
+            k, out = self.k, {}
+            for i, (cle, titre) in enumerate(titres):
+                t = ttk.Frame(parent, style="Tuile.TFrame", padding=(int(14 * k), int(10 * k)))
+                t.pack(side="left", fill="x", expand=True, padx=(0 if i == 0 else int(10 * k), 0))
+                ttk.Label(t, text=titre, style="TuileTitre.TLabel").pack(anchor="w")
+                out[cle] = ttk.Label(t, style="TuileValeur.TLabel", text="—")
+                out[cle].pack(anchor="w")
+                out[cle + "_note"] = ttk.Label(t, style="TuileTitre.TLabel")
+                out[cle + "_note"].pack(anchor="w")
+            return out
+
+        def _table(self, parent, nom: str, colonnes):
+            """Liste d'une fenêtre Outils. colonnes : (identifiant, titre déjà traduit, largeur) ; la première est
+            le nom du jeu. Un clic sur un en-tête trie la liste (self.tris_outils[nom])."""
+            k = self.k
+            cadre = ttk.Frame(parent)
+            arbre = ttk.Treeview(cadre, columns=[c[0] for c in colonnes[1:]], show="tree headings",
+                                 selectmode="browse")
+            for i, (col, _titre, larg) in enumerate(colonnes):
+                ident = "#0" if i == 0 else col
+                arbre.heading(ident, anchor="w" if i == 0 else "e", command=lambda c=col: self._trier_table(nom, c))
+                arbre.column(ident, width=int(larg * k), anchor="w" if i == 0 else "e", stretch=i == 0)
+            sb = ttk.Scrollbar(cadre, orient="vertical", command=arbre.yview)
+            arbre.configure(yscrollcommand=sb.set)
+            arbre.pack(side="left", fill="both", expand=True)
+            sb.pack(side="right", fill="y")
+            arbre.tag_configure("promo", foreground=VERT)
+            arbre.tag_configure("doux", foreground=DOUX)
+            self.tables[nom] = (arbre, colonnes)
+            self._entetes(nom)
+            return cadre, arbre
+
+        def _entetes(self, nom: str):
+            arbre, colonnes = self.tables[nom]
+            col_tri, inverse = self.tris_outils[nom]
+            for i, (col, titre, _larg) in enumerate(colonnes):
+                fleche = (" ▼" if inverse else " ▲") if col == col_tri else ""
+                arbre.heading("#0" if i == 0 else col, text=titre + fleche)
+
+        def _trier_table(self, nom: str, col: str):
+            ancien = self.tris_outils[nom]
+            self.tris_outils[nom] = (col, not ancien[1] if ancien[0] == col else col != "nom")
+            self._entetes(nom)
+            getattr(self, "_remplir_" + nom)()
+
+        # ── valeur de la bibliothèque ──
+        def _ouvrir_valeur(self):
+            w = self._fenetre("fen_valeur", T("Valeur de la bibliothèque"), (900, 720))
+            if w is None:
+                return
+            k = self.k
+            m18 = int(18 * k)
+            haut = ttk.Frame(w, padding=(m18, int(16 * k), m18, 0))
+            haut.pack(fill="x")
+            self.v_tuiles = self._tuiles(haut, (("total", T("Valeur au prix normal")),
+                                                ("jamais", T("Payants, jamais lancés")),
+                                                ("heure", T("Coût moyen par heure jouée"))))
+            outils = ttk.Frame(w, padding=(m18, int(12 * k), m18, int(8 * k)))
+            outils.pack(fill="x")
+            self.v_filtre = tk.StringVar(value=T(FILTRES_VALEUR[0][1]))
+            cb = ttk.Combobox(outils, textvariable=self.v_filtre, values=[T(l) for _, l in FILTRES_VALEUR],
+                              state="readonly", width=max(len(T(l)) for _, l in FILTRES_VALEUR) + 1)
+            cb.pack(side="left")
+            cb.bind("<<ComboboxSelected>>", lambda e: (self._remplir_valeur(), self.v_arbre.focus_set()))
+            self.v_actualiser = ttk.Button(outils, text=T("↻  Actualiser"), command=lambda: self._charger_prix(True))
+            self.v_actualiser.pack(side="right")
+            pied = ttk.Frame(w, padding=(m18, int(10 * k), m18, int(14 * k)))
+            pied.pack(side="bottom", fill="x")
+            self.v_etat = ttk.Label(pied, style="Gris.TLabel", wraplength=int(860 * k), justify="left")
+            self.v_etat.pack(side="left", fill="x", expand=True)
+            ttk.Frame(w, style="Ligne.TFrame", height=1).pack(side="bottom", fill="x", padx=m18)
+            cadre, self.v_arbre = self._table(w, "valeur", (("nom", T("Jeu"), 330), ("prix", T("Prix normal"), 115),
+                                                             ("actuel", T("En ce moment"), 150),
+                                                             ("temps", T("Temps de jeu"), 115),
+                                                             ("heure", T("Prix par heure"), 125)))
+            cadre.pack(fill="both", expand=True, padx=m18)
+            self.v_arbre.bind("<Double-1>", lambda e: self._magasin_ligne(self.v_arbre, e))
+            w.bind("<Escape>", lambda e: w.destroy())
+            self._charger_prix(False)
+
+        def _etat_valeur(self, texte: str, couleur: str = GRIS):
+            if self._ouverte("fen_valeur"):
+                self.v_etat.config(text=texte, foreground=couleur)
+
+        def _charger_prix(self, forcer: bool):
+            """Demande à la boutique Steam le prix de chaque jeu de la liste, dans un fil à part. Les prix sont
+            gardés une heure en mémoire."""
+            if self.prix_occupe:
+                return
+            if self.prix is not None and not forcer and time.time() - self.prix_date < 3600:
+                self._remplir_valeur()
+                return
+            ids = [a for a in self.jeux if a not in self.famille]
+            if not ids:
+                self._etat_valeur(T("Ta liste de jeux est vide."))
+                return
+            self.prix_occupe = True
+            self.v_actualiser.state(["disabled"])
+            self._etat_valeur(T("Lecture des prix dans la boutique Steam…"))
+
+            def tache():
+                res = prix_steam(ids)
+                self.q.put(lambda: self._prix_recus(res))
+            threading.Thread(target=tache, daemon=True).start()
+
+        def _prix_recus(self, res: dict | None):
+            self.prix_occupe = False
+            if res is not None:
+                self.prix, self.prix_date = res, time.time()
+            if not self._ouverte("fen_valeur"):
+                return
+            self.v_actualiser.state(["!disabled"])
+            if res is None:
+                self._etat_valeur(T("La boutique Steam ne répond pas. Vérifie ta connexion, puis clique sur "
+                                    "Actualiser."), ROUGE)
+            if self.prix is not None:
+                self._remplir_valeur(garder_etat=res is None)
+
+        def _remplir_valeur(self, garder_etat: bool = False):
+            if not self._ouverte("fen_valeur") or self.prix is None:
+                return
+            arbre = self.v_arbre
+            arbre.delete(*arbre.get_children())
+            filtre = next((c for c, l in FILTRES_VALEUR if T(l) == self.v_filtre.get()), "tous")
+            lignes, devise, gratuits, retires = [], "", 0, 0
+            for a, j in self.jeux.items():
+                if a in self.famille or a not in self.prix:
+                    continue
+                p = self.prix[a]
+                if p == GRATUIT:
+                    gratuits += 1
+                elif not p:
+                    retires += 1
+                else:
+                    devise = devise or p[0]
+                    lignes.append({"a": a, "nom": j["nom"], "normal": p[1], "actuel": p[2], "promo": remise(p),
+                                   "sec": self._temps_steam(a)})
+            total, actuel = sum(x["normal"] for x in lignes), sum(x["actuel"] for x in lignes)
+            jamais = [x for x in lignes if x["sec"] < 60]
+            joue = sum(x["sec"] for x in lignes) / 3600
+            t = self.v_tuiles
+            t["total"].config(text=argent(total, devise) if lignes else "—")
+            t["total_note"].config(text=T("{p} avec les promos du moment", p=argent(actuel, devise)) if actuel < total
+                                   else pluriel(len(lignes), "{n} jeu payant", "{n} jeux payants"))
+            t["jamais"].config(text=argent(sum(x["normal"] for x in jamais), devise) if lignes else "—")
+            t["jamais_note"].config(text=pluriel(len(jamais), "{n} jeu", "{n} jeux"))
+            t["heure"].config(text=T("{p} / h", p=argent(total / joue, devise)) if joue >= 1 else "—")
+            t["heure_note"].config(text=T("{h} jouées sur ces jeux", h=heures(joue * 60, None)))
+            if filtre == "jamais":
+                lignes = jamais
+            elif filtre == "promo":
+                lignes = [x for x in lignes if x["promo"]]
+            col, inverse = self.tris_outils["valeur"]
+            cles = {"nom": lambda x: x["nom"].lower(), "prix": lambda x: x["normal"], "actuel": lambda x: x["promo"],
+                    "temps": lambda x: x["sec"],
+                    "heure": lambda x: x["normal"] / (x["sec"] / 3600) if x["sec"] >= 60 else math.inf}
+            for x in sorted(lignes, key=cles[col], reverse=inverse):
+                promo = f"{argent(x['actuel'], devise)}   −{pct(x['promo'])}" if x["promo"] else ""
+                if x["sec"] >= 60:
+                    temps, par_heure = heures(x["sec"] / 60), T("{p} / h", p=argent(x["normal"] / (x["sec"] / 3600),
+                                                                                    devise))
+                else:
+                    temps, par_heure = T("jamais lancé"), "—"
+                arbre.insert("", "end", iid=str(x["a"]), text="  " + x["nom"], image=self._icone_tk(x["a"], x["nom"]),
+                             values=(argent(x["normal"], devise), promo, temps, par_heure),
+                             tags=("promo",) if x["promo"] else ())
+            if not garder_etat:
+                self._etat_valeur(T("Prix du moment dans la boutique Steam, pas ce que tu as payé. Double-clic sur un "
+                                    "jeu : page du magasin.") + "  " +
+                                  T("Non comptés : {g} gratuits, {r} retirés de la boutique, {f} partagés par ta "
+                                    "famille.", g=gratuits, r=retires,
+                                    f=sum(1 for a in self.jeux if a in self.famille)))
+
+        # ── stockage ──
+        def _ouvrir_stockage(self):
+            w = self._fenetre("fen_stockage", T("Stockage des jeux installés"), (840, 660))
+            if w is None:
+                return
+            k = self.k
+            m18 = int(18 * k)
+            self.st_haut = ttk.Frame(w, padding=(m18, int(16 * k), m18, 0))
+            self.st_haut.pack(fill="x")
+            outils = ttk.Frame(w, padding=(m18, int(12 * k), m18, int(8 * k)))
+            outils.pack(fill="x")
+            ttk.Label(outils, text=T("Clique sur « Dernier lancement » pour voir en premier les jeux que tu ne lances "
+                                     "plus."), style="Gris.TLabel").pack(side="left")
+            ttk.Button(outils, text=T("↻  Actualiser"), command=self._actualiser_stockage).pack(side="right")
+            pied = ttk.Frame(w, padding=(m18, int(10 * k), m18, int(14 * k)))
+            pied.pack(side="bottom", fill="x")
+            self.st_desinstaller = ttk.Button(pied, text=T("Désinstaller…"), command=self._desinstaller_selection)
+            self.st_desinstaller.pack(side="right")
+            self.st_steam = ttk.Button(pied, text=T("Ouvrir dans Steam"), command=lambda: self._ouvrir(
+                "steam://nav/games/details/{}", self._selection_stockage()))
+            self.st_steam.pack(side="right", padx=(0, 8))
+            self.st_etat = ttk.Label(pied, style="Gris.TLabel", wraplength=int(480 * k), justify="left")
+            self.st_etat.pack(side="left", fill="x", expand=True)
+            ttk.Frame(w, style="Ligne.TFrame", height=1).pack(side="bottom", fill="x", padx=m18)
+            cadre, self.st_arbre = self._table(w, "stockage", (("nom", T("Jeu"), 380), ("taille", T("Taille"), 110),
+                                                                ("lance", T("Dernier lancement"), 170),
+                                                                ("disque", T("Disque"), 90)))
+            cadre.pack(fill="both", expand=True, padx=m18)
+            self.st_arbre.bind("<<TreeviewSelect>>", lambda e: self._maj_boutons_stockage())
+            w.bind("<Escape>", lambda e: w.destroy())
+            self._actualiser_stockage()
+
+        def _etat_stockage(self, texte: str, couleur: str = GRIS):
+            if self._ouverte("fen_stockage"):
+                self.st_etat.config(text=texte, foreground=couleur)
+
+        def _selection_stockage(self) -> int | None:
+            s = self.st_arbre.selection() if self._ouverte("fen_stockage") else ()
+            return int(s[0]) if s else None
+
+        def _maj_boutons_stockage(self):
+            etat = ["!disabled"] if self._selection_stockage() else ["disabled"]
+            self.st_desinstaller.state(etat)
+            self.st_steam.state(etat)
+
+        def _actualiser_stockage(self):
+            """Relit les jeux installés (après une installation ou une désinstallation dans Steam)."""
+            if self.steam:
+                self.installations = jeux_installes(self.steam)
+                self.installes = set(self.installations)
+                self._planifier_banniere()
+                if self._filtre_cle() == "installes":
+                    self._remplir()
+            self._remplir_stockage()
+            self._etat_stockage("")
+
+        def _remplir_stockage(self):
+            if not self._ouverte("fen_stockage"):
+                return
+            arbre = self.st_arbre
+            garde = arbre.selection()
+            arbre.delete(*arbre.get_children())
+            lignes = []
+            for a, x in self.installations.items():
+                if a == APP_REDIST:
+                    continue
+                nom = self.jeux[a]["nom"] if a in self.jeux else (self.infos.get(a, ("",))[0] or x["nom"] or f"App {a}")
+                lignes.append({"a": a, "nom": nom, "taille": x["taille"], "disque": x["disque"].rstrip("\\/"),
+                               "lance": max(x["lance"], self.lances.get(a, 0))})
+            col, inverse = self.tris_outils["stockage"]
+            cles = {"nom": lambda x: x["nom"].lower(), "taille": lambda x: x["taille"], "lance": lambda x: x["lance"],
+                    "disque": lambda x: (x["disque"], x["nom"].lower())}
+            for x in sorted(lignes, key=cles[col], reverse=inverse):
+                arbre.insert("", "end", iid=str(x["a"]), text="  " + x["nom"], image=self._icone_tk(x["a"], x["nom"]),
+                             values=(taille_txt(x["taille"]), depuis_txt(x["lance"]), x["disque"]))
+            garde = [i for i in garde if arbre.exists(i)]
+            if garde:
+                arbre.selection_set(garde)
+            for enfant in self.st_haut.winfo_children():
+                enfant.destroy()
+            disques = sorted({x["disque"] for x in lignes})[:3]
+            tuiles = self._tuiles(self.st_haut, [("jeux", T("Espace pris par tes jeux"))] +
+                                  [(f"d{i}", T("Disque {d}", d=d)) for i, d in enumerate(disques)])
+            tuiles["jeux"].config(text=taille_txt(sum(x["taille"] for x in lignes)))
+            tuiles["jeux_note"].config(text=pluriel(len(lignes), "{n} jeu installé", "{n} jeux installés"))
+            for i, d in enumerate(disques):
+                try:
+                    usage = shutil.disk_usage(d + "\\")
+                except OSError:
+                    continue
+                tuiles[f"d{i}"].config(text=T("{t} libres", t=taille_txt(usage.free)))
+                tuiles[f"d{i}_note"].config(text=T("sur {t}", t=taille_txt(usage.total)))
+            self._maj_boutons_stockage()
+
+        def _desinstaller_selection(self):
+            a = self._selection_stockage()
+            if a:
+                self._desinstaller(a)
+
+        def _desinstaller(self, a: int):
+            """Ouvre la fenêtre de désinstallation de Steam : c'est Steam qui demande confirmation."""
+            if a in self.procs:
+                msg = T("{nom} est en cours de farm : retire-le du farm avant de le désinstaller.", nom=self._nom(a))
+                self.etat.config(text=msg)
+                self._etat_stockage(msg, ORANGE)
+                return
+            self._ouvrir("steam://uninstall/{}", a)
+            self._etat_stockage(T("Steam te demande de confirmer. Clique ensuite sur Actualiser."))
+
+        # ── promos de la liste de souhaits ──
+        def _ouvrir_souhaits(self):
+            w = self._fenetre("fen_souhaits", T("Promos de ma liste de souhaits"), (800, 620))
+            if w is None:
+                return
+            k = self.k
+            m18 = int(18 * k)
+            haut = ttk.Frame(w, padding=(m18, int(16 * k), m18, int(4 * k)))
+            haut.pack(fill="x")
+            ttk.Label(haut, text=T("Liste de souhaits"), style="Titre.TLabel").pack(anchor="w")
+            self.p_resume = ttk.Label(haut, style="Doux.TLabel")
+            self.p_resume.pack(anchor="w", pady=(int(4 * k), 0))
+            outils = ttk.Frame(w, padding=(m18, int(10 * k), m18, int(8 * k)))
+            outils.pack(fill="x")
+            ttk.Button(outils, text=T("Ouvrir ma liste dans Steam"), command=lambda: self._ouvrir_lien(
+                "steam://openurl/https://store.steampowered.com/wishlist/")).pack(side="left")
+            self.p_actualiser = ttk.Button(outils, text=T("↻  Actualiser"),
+                                           command=lambda: self._charger_souhaits(True))
+            self.p_actualiser.pack(side="right")
+            pied = ttk.Frame(w, padding=(m18, int(10 * k), m18, int(14 * k)))
+            pied.pack(side="bottom", fill="x")
+            ttk.Checkbutton(pied, text=T("Vérifier chaque jour et me prévenir des nouvelles promos"),
+                            variable=self.promos_auto, command=self._sauver).pack(anchor="w")
+            self.p_etat = ttk.Label(pied, style="Gris.TLabel", wraplength=int(760 * k), justify="left")
+            self.p_etat.pack(anchor="w", pady=(int(4 * k), 0))
+            ttk.Frame(w, style="Ligne.TFrame", height=1).pack(side="bottom", fill="x", padx=m18)
+            cadre, self.p_arbre = self._table(w, "souhaits", (("nom", T("Jeu"), 380), ("prix", T("Prix"), 115),
+                                                               ("promo", T("Promo"), 95),
+                                                               ("normal", T("Prix normal"), 115)))
+            cadre.pack(fill="both", expand=True, padx=m18)
+            self.p_arbre.bind("<Double-1>", lambda e: self._magasin_ligne(self.p_arbre, e))
+            w.bind("<Escape>", lambda e: w.destroy())
+            self._charger_souhaits(False)
+
+        def _etat_souhaits(self, texte: str, couleur: str = GRIS):
+            if self._ouverte("fen_souhaits"):
+                self.p_etat.config(text=texte, foreground=couleur)
+
+        def _charger_souhaits(self, forcer: bool, notifier: bool = False):
+            """Demande à Steam la liste de souhaits du compte puis les prix du moment, dans un fil à part.
+            notifier : vérification quotidienne, qui prévient des promos pas encore vues."""
+            if self.souhaits_occupe:
+                return
+            if self.souhaits is not None and not forcer and time.time() - self.souhaits_date < 1800:
+                self._remplir_souhaits()
+                return
+            uid = compte_utilisateur(self.steam) if self.steam else 0
+            if not uid:
+                self._etat_souhaits(T("Aucun compte Steam trouvé sur ce PC."), ORANGE)
+                return
+            self.souhaits_occupe = True
+            if self._ouverte("fen_souhaits"):
+                self.p_actualiser.state(["disabled"])
+                self._etat_souhaits(T("Lecture de ta liste de souhaits et des prix…"))
+            noms, langue = {a: i[0] for a, i in self.infos.items()}, LANGUE
+
+            def tache():
+                res = souhaits_steam(uid, noms, langue)
+                self.q.put(lambda: self._souhaits_recus(res, notifier))
+            threading.Thread(target=tache, daemon=True).start()
+
+        def _souhaits_recus(self, res: list | None, notifier: bool):
+            self.souhaits_occupe = False
+            if res is not None:
+                self.souhaits, self.souhaits_date = res, time.time()
+                vues = self.cfg.get("promos_vues", {})
+                nouvelles = [x for x in res if remise(x["prix"]) > int(vues.get(str(x["a"]), 0) or 0)]
+                # promos déjà signalées (ou vues dans la fenêtre) : une promo terminée sort de la liste
+                self.cfg["promos_vues"] = {str(x["a"]): remise(x["prix"]) for x in res if remise(x["prix"])}
+                if notifier:
+                    self.cfg["promos_verifiees"] = time.time()
+                    if len(nouvelles) == 1:
+                        p = nouvelles[0]["prix"]
+                        self._notifier(T("Promo sur ta liste de souhaits : {nom} à −{p} ({prix}).",
+                                         nom=nouvelles[0]["nom"], p=pct(remise(p)), prix=argent(p[2], p[0])))
+                    elif nouvelles:
+                        noms = ", ".join(x["nom"] for x in nouvelles[:3]) + ("…" if len(nouvelles) > 3 else "")
+                        self._notifier(T("{n} promos sur ta liste de souhaits : {noms}", n=len(nouvelles), noms=noms))
+                self._sauver()
+            if not self._ouverte("fen_souhaits"):
+                return
+            self.p_actualiser.state(["!disabled"])
+            if res is None:
+                self._etat_souhaits(T("Steam ne répond pas. Vérifie ta connexion, puis clique sur Actualiser."), ROUGE)
+            if self.souhaits is not None:
+                self._remplir_souhaits(garder_etat=res is None)
+
+        def _remplir_souhaits(self, garder_etat: bool = False):
+            if not self._ouverte("fen_souhaits") or self.souhaits is None:
+                return
+            arbre = self.p_arbre
+            arbre.delete(*arbre.get_children())
+            col, inverse = self.tris_outils["souhaits"]
+
+            def prix(x, i):          # un jeu sans prix (pas encore sorti…) se range après les autres
+                return x["prix"][i] if isinstance(x["prix"], tuple) else (-1 if inverse else math.inf)
+
+            cles = {"nom": lambda x: x["nom"].lower(), "prix": lambda x: prix(x, 2), "normal": lambda x: prix(x, 1),
+                    "promo": lambda x: remise(x["prix"])}
+            ordre = sorted(self.souhaits, key=lambda x: x["nom"].lower())
+            for x in sorted(ordre, key=cles[col], reverse=inverse):
+                p, r = x["prix"], remise(x["prix"])
+                if isinstance(p, tuple):
+                    valeurs = (argent(p[2], p[0]), "−" + pct(r) if r else "", argent(p[1], p[0]) if r else "")
+                else:
+                    valeurs = ("—", "", "")
+                arbre.insert("", "end", iid=str(x["a"]), text="  " + x["nom"], image=self._icone_tk(x["a"], x["nom"]),
+                             values=valeurs, tags=("promo",) if r else ())
+            n, promos = len(self.souhaits), sum(1 for x in self.souhaits if remise(x["prix"]))
+            if not n:
+                self.p_resume.config(text=T("Ta liste de souhaits est vide, ou elle n'est pas publique."))
+                if not garder_etat:
+                    self._etat_souhaits(T("Pour que l'appli la voie : dans Steam, ton profil → Modifier le profil → "
+                                          "Confidentialité → « Détails du jeu » : Public."))
+                return
+            self.p_resume.config(text=pluriel(n, "{n} jeu dans ta liste de souhaits", "{n} jeux dans ta liste de "
+                                              "souhaits") + "  ·  " + T("{n} en promo", n=promos))
+            if not garder_etat:
+                self._etat_souhaits(T("L'appli demande ta liste à Steam avec ton identifiant Steam public, puis les prix "
+                                      "à la boutique. Double-clic sur un jeu : page du magasin."))
+
+        def _verifier_promos(self):
+            """Si l'option est cochée : une fois par jour, cherche les promos de la liste de souhaits et prévient."""
+            if not self.promos_auto.get() or self.souhaits_occupe:
+                return
+            if time.time() - float(self.cfg.get("promos_verifiees", 0) or 0) < 24 * 3600:
+                return
+            self._charger_souhaits(True, notifier=True)
+
+        # ── captures d'écran ──
+        def _taille_vignette(self) -> tuple[int, int, int]:
+            k = self.k
+            return int(200 * k), int(112 * k), int(12 * k)
+
+        def _ouvrir_captures(self, a: int | None = None):
+            if self.steam:           # relues à chaque ouverture : une capture vient peut-être d'être prise
+                self.captures = captures_steam(self.steam, compte_utilisateur(self.steam))
+            deja = self._ouverte("fen_captures")
+            w = self._fenetre("fen_captures", T("Captures d'écran"), (960, 720))
+            if w is None and not deja:
+                return
+            if w is not None:
+                k = self.k
+                m18 = int(18 * k)
+                haut = ttk.Frame(w, padding=(m18, int(16 * k), m18, int(12 * k)))
+                haut.pack(fill="x")
+                self.c_choix = tk.StringVar()
+                self.c_cb = ttk.Combobox(haut, textvariable=self.c_choix, state="readonly", width=42)
+                self.c_cb.pack(side="left")
+                self.c_cb.bind("<<ComboboxSelected>>", lambda e: (self._choisir_captures(
+                    self.c_ids[self.c_cb.current()]), self.c_toile.focus_set()))
+                self.c_dossier = ttk.Button(haut, text=T("Ouvrir le dossier"), command=self._dossier_captures)
+                self.c_dossier.pack(side="left", padx=(10, 0))
+                self.c_resume = ttk.Label(haut, style="Gris.TLabel")
+                self.c_resume.pack(side="right")
+                corps = ttk.Frame(w, padding=(m18, 0, m18, m18))
+                corps.pack(fill="both", expand=True)
+                self.c_toile = tk.Canvas(corps, bg=FOND, highlightthickness=0, bd=0, yscrollincrement=int(40 * k))
+                sb = ttk.Scrollbar(corps, orient="vertical", command=self.c_toile.yview)
+                self.c_toile.configure(yscrollcommand=sb.set)
+                self.c_toile.pack(side="left", fill="both", expand=True)
+                sb.pack(side="right", fill="y")
+                self.c_toile.bind("<Configure>", lambda e: self._placer_captures())
+                w.bind("<MouseWheel>", lambda e: self.c_toile.yview_scroll(-3 if e.delta > 0 else 3, "units"))
+                w.bind("<Escape>", lambda e: w.destroy())
+            self.c_ids = sorted(self.captures, key=lambda i: self._nom(i).lower())
+            self.c_cb["values"] = [f"{self._nom(i)}   ({len(self.captures[i])})" for i in self.c_ids]
+            if a not in self.captures:
+                a = self.sel if self.sel in self.captures else None
+            if a is None and self.captures:
+                a = max(self.captures, key=lambda i: len(self.captures[i]))
+            self._choisir_captures(a)
+
+        def _choisir_captures(self, a: int | None):
+            self.c_gen += 1
+            toile = self.c_toile
+            toile.delete("all")
+            toile.yview_moveto(0)
+            self.c_jeu, self.c_tk, self.c_cases = a, {}, []
+            self.c_dossier.state(["disabled"] if a is None else ["!disabled"])
+            if a is None:
+                self.c_choix.set("")
+                self.c_resume.config(text="")
+                self.c_vide = toile.create_text(0, 0, fill=GRIS, font=("Segoe UI", 11), justify="center",
+                                                text=T("Aucune capture d'écran Steam sur ce PC.\nDans un jeu, appuie "
+                                                       "sur F12 pour en prendre une."))
+                self._placer_captures()
+                return
+            self.c_cb.current(self.c_ids.index(a))
+            toutes = self.captures[a]
+            fichiers = toutes[:MAX_CAPTURES]
+            resume = pluriel(len(toutes), "{n} capture", "{n} captures")
+            if len(toutes) > len(fichiers):
+                resume += "  ·  " + T("les {n} plus récentes affichées", n=len(fichiers))
+            self.c_resume.config(text=resume)
+            for p in fichiers:
+                cadre = toile.create_rectangle(0, 0, 0, 0, fill=PANNEAU, width=0)
+                image = toile.create_image(0, 0, anchor="nw")
+                ts = date_capture(p)
+                texte = toile.create_text(0, 0, anchor="nw", fill=GRIS, font=("Segoe UI", 9),
+                                          text=date_longue(ts) if ts else "")
+                for objet in (cadre, image):
+                    toile.tag_bind(objet, "<Button-1>", lambda e, p=p: self._ouvrir_lien(str(p)))
+                self.c_cases.append((p, cadre, image, texte))
+            self._placer_captures()
+            self._charger_vignettes(self.c_gen, 0)
+
+        def _placer_captures(self):
+            """Range les vignettes en colonnes selon la largeur de la fenêtre."""
+            if not self._ouverte("fen_captures"):
+                return
+            toile, k = self.c_toile, self.k
+            large, haut = toile.winfo_width(), toile.winfo_height()
+            if large < 50:
+                return
+            if self.c_jeu is None:
+                toile.coords(self.c_vide, large / 2, haut / 2)
+                toile.configure(scrollregion=(0, 0, large, haut))
+                return
+            tw, th, g = self._taille_vignette()
+            colonnes = max(1, (large + g) // (tw + g))
+            # les vignettes sont réparties sur toute la largeur (l'écart s'agrandit un peu plutôt qu'un vide à droite)
+            ecart = (large - colonnes * tw) / (colonnes - 1) if colonnes > 1 else g
+            pas = th + int(22 * k) + g
+            for i, (_p, cadre, image, texte) in enumerate(self.c_cases):
+                x, y = int((i % colonnes) * (tw + ecart)), (i // colonnes) * pas
+                toile.coords(cadre, x, y, x + tw, y + th)
+                toile.coords(image, x, y)
+                toile.coords(texte, x, y + th + int(3 * k))
+            lignes = (len(self.c_cases) + colonnes - 1) // colonnes
+            toile.configure(scrollregion=(0, 0, large, max(lignes * pas, haut)))
+
+        def _charger_vignettes(self, gen: int, debut: int):
+            """Charge les vignettes par petits lots, pour que la fenêtre reste fluide."""
+            if gen != self.c_gen or not self._ouverte("fen_captures"):
+                return
+            tw, th, _g = self._taille_vignette()
+            for i in range(debut, min(debut + 8, len(self.c_cases))):
+                p, _cadre, image, _texte = self.c_cases[i]
+                try:
+                    mini = p.parent / "thumbnails" / p.name        # vignette déjà faite par Steam (200 x 112)
+                    src = Image.open(mini if self.k <= 1 and mini.exists() else p)
+                    src.draft("RGB", (tw, th))
+                    self.c_tk[i] = ImageTk.PhotoImage(couvrir(src.convert("RGB"), tw, th))
+                    self.c_toile.itemconfig(image, image=self.c_tk[i])
+                except (OSError, ValueError):
+                    pass
+            if debut + 8 < len(self.c_cases):
+                self.r.after(15, lambda: self._charger_vignettes(gen, debut + 8))
+
+        def _dossier_captures(self):
+            if self.c_jeu in self.captures:
+                self._ouvrir_lien(str(self.captures[self.c_jeu][0].parent))
+
+        # ── « À quoi je joue ? » ──
+        def _ouvrir_hasard(self):
+            w = self._fenetre("fen_hasard", T("À quoi je joue ?"), (600, 500))
+            if w is None:
+                return
+            k = self.k
+            m18 = int(18 * k)
+            haut = ttk.Frame(w, padding=(m18, int(16 * k), m18, int(12 * k)))
+            haut.pack(fill="x")
+            ttk.Label(haut, text=T("Tirer au sort parmi"), style="Doux.TLabel").pack(side="left", padx=(0, 8))
+            self.h_choix = tk.StringVar(value=T(HASARD[0][1]))
+            cb = ttk.Combobox(haut, textvariable=self.h_choix, values=[T(l) for _, l in HASARD], state="readonly",
+                              width=max(len(T(l)) for _, l in HASARD) + 1)
+            cb.pack(side="left")
+            cb.bind("<<ComboboxSelected>>", lambda e: (self._tirer(), self.h_autre.focus_set()))
+            pied = ttk.Frame(w, padding=(m18, int(10 * k), m18, int(16 * k)))
+            pied.pack(side="bottom", fill="x")
+            self.h_lancer = ttk.Button(pied, style="Accent.TButton", width=14, command=self._lancer_hasard)
+            self.h_lancer.pack(side="right")
+            self.h_autre = ttk.Button(pied, text=T("↻  Un autre"), command=self._tirer)
+            self.h_autre.pack(side="right", padx=(0, 8))
+            self.h_magasin = ttk.Button(pied, text=T("Page du magasin"), command=lambda: self._ouvrir(
+                "https://store.steampowered.com/app/{}", self.h_jeu))
+            self.h_magasin.pack(side="left")
+            self.h_image = tk.Label(w, bg=PANNEAU, bd=0)
+            self.h_image.pack(padx=m18)
+            self.h_nom = ttk.Label(w, style="Titre.TLabel", wraplength=int(560 * k), justify="center")
+            self.h_nom.pack(pady=(int(12 * k), int(2 * k)))
+            self.h_infos = ttk.Label(w, style="Doux.TLabel", wraplength=int(560 * k), justify="center")
+            self.h_infos.pack()
+            w.bind("<Escape>", lambda e: w.destroy())
+            self._tirer()
+
+        def _tirer(self):
+            """Tire un jeu au sort dans la catégorie choisie (jamais le même deux fois de suite)."""
+            if not self._ouverte("fen_hasard"):
+                return
+            k = self.k
+            cle = next((c for c, l in HASARD if T(l) == self.h_choix.get()), "tous")
+            lot = [a for a, j in self.jeux.items()
+                   if cle == "tous" or (cle == "jamais" and not j["min"]) or (cle == "peu" and 0 < j["min"] < 120)
+                   or (cle == "installes" and a in self.installes)]
+            if len(lot) > 1 and self.h_jeu in lot:
+                lot.remove(self.h_jeu)
+            large, haut = int(560 * k), int(262 * k)
+            base = None
+            a = self.h_jeu = random.choice(lot) if lot else None
+            if a is not None:
+                ch = self._chemins(a)
+                for c in ("entete", "hero", "capsule"):
+                    if ch.get(c):
+                        try:
+                            src = Image.open(ch[c])
+                            src.draft("RGB", (large, haut))
+                            base = couvrir(src.convert("RGB"), large, haut)
+                            break
+                        except OSError:
+                            base = None
+            self._h_tk = ImageTk.PhotoImage(base or Image.new("RGB", (large, haut), PANNEAU))
+            self.h_image.config(image=self._h_tk)
+            for b in (self.h_lancer, self.h_magasin):
+                b.state(["disabled"] if a is None else ["!disabled"])
+            if a is None:
+                self.h_nom.config(text=T("Aucun jeu dans cette catégorie."))
+                self.h_infos.config(text="")
+                self.h_lancer.config(text=T("▶  Lancer"))
+                return
+            sec = self._temps_steam(a)
+            infos = [T("Temps de jeu : {t}", t=heures(sec / 60)) if sec >= 60 else T("Jamais lancé"),
+                     T("Installé") if a in self.installes else T("Pas installé")]
+            n = self._succes_compte(a)
+            if n:
+                infos.append(T("Succès  {f}/{n}", f=n[0], n=n[1]))
+            if sec >= 60 and self.lances.get(a):
+                infos.append(T("Dernier lancement : {d}", d=depuis_txt(self.lances[a])))
+            self.h_nom.config(text=self.jeux[a]["nom"])
+            self.h_infos.config(text="   ·   ".join(infos))
+            self.h_lancer.config(text=T("▶  Lancer") if a in self.installes else T("Installer"))
+
+        def _lancer_hasard(self):
+            a = self.h_jeu
+            if a is None:
+                return
+            if a not in self.installes:
+                self._installer(a)
+                return
+            delai = 0
+            if a in self.coches:     # jeu dans le farm : Steam refuserait de le lancer (« déjà en cours d'exécution »)
+                delai = 1500 if a in self.procs else 0
+                self._basculer_jeux([a], demander=False)
+                self.etat.config(text=T("{nom} est retiré du farm pour que tu puisses y jouer.", nom=self.jeux[a]["nom"]))
+            self.r.after(delai, lambda: self._ouvrir("steam://rungameid/{}", a))
+
+        # ── collections Steam ──
+        def _nom_collection(self, c) -> str:
+            nom = T("Favoris") if c[0] == "favorite" else c[1]
+            return "▸ " + (nom if len(nom) <= 24 else nom[:23] + "…")
+
+        def _valeurs_filtre(self) -> list[str]:
+            return [T(l) for _, l in FILTRES] + [self._nom_collection(c) for c in self.collections]
+
+        def _appliquer_collection(self, i: int):
+            c = self.collections[i]
+            cible = [a for a in self.jeux if a in c[2]]
+            self._basculer_jeux([a for a in self.coches if a not in cible] + [a for a in cible if a not in self.coches])
+            self.etat.config(text=pluriel(len(cible), "Collection « {nom} » : {n} jeu coché.",
+                                          "Collection « {nom} » : {n} jeux cochés.", nom=self._nom_collection(c)[2:]))
+
         # ── nouvelle version ──
         def _verifier_maj(self, forcer: bool = False):
             """Demande à GitHub la dernière version (une fois par jour au plus), dans un fil à part."""
@@ -2085,14 +3039,14 @@ def interface(auto: bool, apres=None) -> None:
             v = str(self.cfg.get("maj_version", ""))
             if self.maj_auto.get() and v and version_num(v) > version_num(VERSION):
                 self.l_maj.config(text=T("Nouvelle version {v}  ↗", v=v))
-                if not self.l_maj.winfo_ismapped():
-                    self.l_maj.pack(side="right", padx=(0, int(16 * self.k)), pady=(3, 0))
+                self.l_maj.pack_configure(padx=(0, int(16 * self.k)))
                 if self.cfg.get("maj_notifiee") != v:      # une seule notification par version
                     self.cfg["maj_notifiee"] = v
                     self._sauver()
                     self._notifier(T("La version {v} est disponible sur GitHub.", v=v))
             else:
-                self.l_maj.pack_forget()
+                self.l_maj.config(text="")
+                self.l_maj.pack_configure(padx=0)
 
         def _regler_maj(self):
             self._sauver()
@@ -2205,15 +3159,13 @@ def interface(auto: bool, apres=None) -> None:
             try:
                 steam = dossier_steam()
                 infos = infos_applis(steam)
-                temps = temps_de_jeu(steam)
-                candidats, installes = set(temps), set()
+                apps = apps_locales(steam)
+                temps = temps_de_jeu(steam, apps)
+                installations = jeux_installes(steam)
+                candidats, installes = set(temps), set(installations)
                 cache = steam / "appcache" / "librarycache"
                 if cache.exists():
                     candidats |= {int(p.name) for p in cache.iterdir() if p.name.isdigit()}
-                for lib in bibliotheques(steam):
-                    for f in (lib / "steamapps").glob("appmanifest_*.acf"):
-                        if f.stem[12:].isdigit():
-                            installes.add(int(f.stem[12:]))
                 candidats |= installes
                 jeux = {a for a in candidats if a in infos and infos[a][1] == "game"}
                 note, verif = "", None
@@ -2231,26 +3183,39 @@ def interface(auto: bool, apres=None) -> None:
                 s = int(24 * self.k)
                 chemins = {a: chemins_images(steam, a) for a in jeux}
                 icones = {a: icone_jeu(chemins[a].get("icone"), infos.get(a, ("?",))[0], s) for a in jeux}
-                succes = succes_locaux(steam, compte_utilisateur(steam))
-                self.chargement = (steam, jeux, infos, temps, installes, verif, chemins, icones, succes, note, None)
+                uid = compte_utilisateur(steam)
+                succes = succes_locaux(steam, uid)
+                outils = {"installations": installations, "lances": derniers_lancements(apps),
+                          "collections": collections_steam(steam, uid), "captures": captures_steam(steam, uid)}
+                self.chargement = (steam, jeux, infos, temps, installes, verif, chemins, icones, succes, outils,
+                                   note, None)
             except Exception as e:  # noqa: BLE001 — affiché dans la fenêtre
                 journal(T("chargement : {e}", e=repr(e)))
-                self.chargement = (None, set(), {}, {}, set(), None, {}, {}, {}, "", repr(e))
+                self.chargement = (None, set(), {}, {}, set(), None, {}, {}, {}, {}, "", repr(e))
 
         def _appliquer_chargement(self):
-            steam, jeux, infos, temps, installes, verif, chemins, icones, succes, note, err = self.chargement
+            (steam, jeux, infos, temps, installes, verif, chemins, icones, succes, outils, note,
+             err) = self.chargement
             self.chargement = None
             if err:
                 self.sous_titre.config(text=T("impossible de lire Steam : {e}", e=err))
                 return
             self.steam, self.infos, self.installes = steam, infos, installes
             self.succes_cache = succes
+            self.installations, self.lances, self.captures = outils["installations"], outils["lances"], outils["captures"]
             self.gratuits = {a for a, i in infos.items() if i[2]}
             self.chemins.update(chemins)
             self.icones.update(icones)
             self.images.clear()
             self.jeux = {a: {"nom": infos.get(a, (f"App {a}",))[0], "min": temps.get(a, 0)} for a in jeux}
             self.base_farme = {a: self._total(a) for a in self.jeux}
+            # collections Steam qui contiennent au moins un jeu de la liste : ajoutées aux filtres
+            self.collections = [c for c in outils["collections"] if any(a in self.jeux for a in c[2])]
+            valeurs = self._valeurs_filtre()
+            self.cb_filtre.config(values=valeurs, width=max(15, max(map(len, valeurs)) + 1))
+            if self.filtre.get() not in valeurs:
+                self.filtre.set(valeurs[0])
+            self._icones_tk.clear()
             if verif is not None:
                 self.cfg["possedes"] = sorted(verif["possedes"])
                 self.achats.update(verif["achats"])
@@ -2587,8 +3552,12 @@ def interface(auto: bool, apres=None) -> None:
             return () if a in self.coches else ("off",)
 
         def _filtre_cle(self) -> str:
+            """Filtre choisi : une clé de FILTRES, ou « col:<n> » pour la n-ième collection Steam."""
             v = self.filtre.get()
-            return next((c for c, l in FILTRES if T(l) == v), "tous")
+            cle = next((c for c, l in FILTRES if T(l) == v), None)
+            if cle is None:
+                cle = next((f"col:{i}" for i, c in enumerate(self.collections) if self._nom_collection(c) == v), "tous")
+            return cle
 
         def _visible(self, a: int, q: str) -> bool:
             if q and q not in self.jeux[a]["nom"].lower() and q != str(a):
@@ -2597,7 +3566,8 @@ def interface(auto: bool, apres=None) -> None:
             return (f == "tous" or (f == "coches" and a in self.coches) or (f == "encours" and a in self.procs)
                     or (f == "objectif" and a in self.objectifs) or (f == "remb" and self._remboursable(a))
                     or (f == "jamais" and not self.jeux[a]["min"]) or (f == "installes" and a in self.installes)
-                    or (f == "presque" and self._presque_fini(a)))
+                    or (f == "presque" and self._presque_fini(a))
+                    or (f.startswith("col:") and a in self.collections[int(f[4:])][2]))
 
         def _remplir(self):
             q = self.recherche.get().strip().lower()
@@ -2681,8 +3651,13 @@ def interface(auto: bool, apres=None) -> None:
             m.add_command(label=T("Farmer encore quelques heures…"), command=lambda: self._encore_dialogue(ids))
             m.add_separator()
             m.add_command(label=T("Succès…"), command=lambda: self._ouvrir_succes(a))
+            if self.captures.get(a):
+                m.add_command(label=T("Captures d'écran ({n})…", n=len(self.captures[a])),
+                              command=lambda: self._ouvrir_captures(a))
             if self._a_installer(a):
                 m.add_command(label=T("Installer"), command=lambda: self._installer(a))
+            elif a in self.installations:
+                m.add_command(label=T("Désinstaller…"), command=lambda: self._desinstaller(a))
             m.add_command(label=T("Ouvrir dans la bibliothèque Steam"),
                           command=lambda: self._ouvrir("steam://nav/games/details/{}", a))
             m.add_command(label=T("Page du magasin"),
@@ -2835,6 +3810,15 @@ def interface(auto: bool, apres=None) -> None:
                     sup.add_command(label=nom, command=lambda nom=nom: self._supprimer_groupe(nom))
                 m.add_separator()
                 m.add_cascade(label=T("Supprimer un groupe"), menu=sup)
+            if self.collections:
+                col = self.menu_col
+                col.delete(0, "end")
+                for i, c in enumerate(self.collections):
+                    col.add_command(label=pluriel(sum(1 for a in c[2] if a in self.jeux), "{nom}   ({n} jeu)",
+                                                  "{nom}   ({n} jeux)", nom=self._nom_collection(c)[2:]),
+                                    command=lambda i=i: self._appliquer_collection(i))
+                m.add_separator()
+                m.add_cascade(label=T("Cocher une collection Steam"), menu=col)
             b = self.b_groupes
             m.tk_popup(b.winfo_rootx(), b.winfo_rooty() + b.winfo_height())
 
@@ -3054,6 +4038,10 @@ def interface(auto: bool, apres=None) -> None:
                 self._maj_ligne(a)
             self._maj_banniere_textes()
             self._demarrage_auto()
+            if now - self._derniere_veille > 1800:      # toutes les 30 min ; chaque vérification se limite à une par jour
+                self._derniere_veille = now
+                self._verifier_maj()
+                self._verifier_promos()
 
         def _raison_pause(self, now: float, steam_ferme: bool) -> str | None:
             """Pourquoi le farm doit rester en pause en ce moment (ou None)."""
@@ -3210,6 +4198,7 @@ def interface(auto: bool, apres=None) -> None:
                 eveille=self.eveille.get(), invisible=self.invisible.get(), pause_jeu=self.pause_jeu.get(),
                 si_inactif=self.si_inactif.get(), inactif_min=self.inactif_min.get(), maj_auto=self.maj_auto.get(),
                 plage=self.plage.get(), plage_debut=self.plage_debut.get(), plage_fin=self.plage_fin.get(),
+                promos_auto=self.promos_auto.get(),
                 tri=list(self.tri),
                 farme={str(a): round(self._total(a)) for a in set(self.farme) | set(self.procs)},
                 objectifs={str(a): h for a, h in self.objectifs.items()}, atteints=sorted(self.atteints),
@@ -3236,6 +4225,18 @@ def interface(auto: bool, apres=None) -> None:
     # pythonw et le .exe n'ont pas de console : sans ça, une erreur de l'interface ne laisserait aucune trace
     threading.excepthook = lambda a: erreur(a.exc_type, a.exc_value, a.exc_traceback)
     r = tk.Tk()
+
+    # Garde-fou : sous Windows, Tk voit parfois un message qui disparaît avant d'être lu (par exemple quand un
+    # logiciel de capture photographie la fenêtre) et attend alors le suivant sans limite. Le suivi du farm resterait
+    # figé tant que la fenêtre ne reçoit rien. Un message vide par seconde garantit que la boucle repart.
+    fil_tk = ctypes.windll.kernel32.GetCurrentThreadId()
+
+    def reveil():
+        while True:
+            time.sleep(1)
+            ctypes.windll.user32.PostThreadMessageW(fil_tk, 0, 0, 0)
+
+    threading.Thread(target=reveil, daemon=True).start()
     r.report_callback_exception = erreur
     appli = Appli(r)
     if apres:
@@ -3274,6 +4275,114 @@ EN = {
     "Succès presque finis": "Achievements almost done",
     "Installer": "Install",
     "Mises à jour": "Updates",
+    # menu Outils
+    "Outils  ▾": "Tools  ▾",
+    "Valeur de la bibliothèque…": "Library value…",
+    "Stockage des jeux installés…": "Storage of installed games…",
+    "Promos de ma liste de souhaits…": "Wishlist deals…",
+    "Captures d'écran…": "Screenshots…",
+    "À quoi je joue ?…": "What should I play?…",
+    "↻  Actualiser": "↻  Refresh",
+    "jamais": "never",
+    "aujourd'hui": "today",
+    "hier": "yesterday",
+    "il y a {n} jours": "{n} days ago",
+    "il y a {n} mois": "{n} months ago",
+    "il y a {n} ans": "{n} years ago",
+    # valeur de la bibliothèque
+    "Valeur de la bibliothèque": "Library value",
+    "Valeur au prix normal": "Value at regular price",
+    "Payants, jamais lancés": "Paid, never played",
+    "Coût moyen par heure jouée": "Average cost per hour played",
+    "Tous les jeux payants": "All paid games",
+    "En promo en ce moment": "On sale right now",
+    "Prix normal": "Regular price",
+    "En ce moment": "Right now",
+    "Temps de jeu": "Playtime",
+    "Prix par heure": "Price per hour",
+    "Ta liste de jeux est vide.": "Your game list is empty.",
+    "Lecture des prix dans la boutique Steam…": "Reading prices from the Steam store…",
+    "La boutique Steam ne répond pas. Vérifie ta connexion, puis clique sur Actualiser.":
+        "The Steam store isn't answering. Check your connection, then click Refresh.",
+    "{p} avec les promos du moment": "{p} with current sales",
+    "{n} jeu payant": "{n} paid game",
+    "{n} jeux payants": "{n} paid games",
+    "{p} / h": "{p}/h",
+    "{h} jouées sur ces jeux": "{h} played on these games",
+    "jamais lancé": "never played",
+    "Prix du moment dans la boutique Steam, pas ce que tu as payé. Double-clic sur un jeu : page du magasin.":
+        "Current Steam store prices, not what you paid. Double-click a game for its store page.",
+    "Non comptés : {g} gratuits, {r} retirés de la boutique, {f} partagés par ta famille.":
+        "Not counted: {g} free, {r} removed from the store, {f} shared by your family.",
+    # stockage
+    "Stockage des jeux installés": "Storage of installed games",
+    "Clique sur « Dernier lancement » pour voir en premier les jeux que tu ne lances plus.":
+        "Click \"Last played\" to see the games you no longer launch first.",
+    "Désinstaller…": "Uninstall…",
+    "Taille": "Size",
+    "Dernier lancement": "Last played",
+    "Disque": "Drive",
+    "Espace pris par tes jeux": "Space used by your games",
+    "Disque {d}": "Drive {d}",
+    "{n} jeu installé": "{n} game installed",
+    "{n} jeux installés": "{n} games installed",
+    "{t} libres": "{t} free",
+    "sur {t}": "of {t}",
+    "{nom} est en cours de farm : retire-le du farm avant de le désinstaller.":
+        "{nom} is being farmed: remove it from the farm before uninstalling it.",
+    "Steam te demande de confirmer. Clique ensuite sur Actualiser.": "Steam asks you to confirm. Then click Refresh.",
+    # promos de la liste de souhaits
+    "Promos de ma liste de souhaits": "Wishlist deals",
+    "Liste de souhaits": "Wishlist",
+    "Ouvrir ma liste dans Steam": "Open my wishlist in Steam",
+    "Vérifier chaque jour et me prévenir des nouvelles promos": "Check every day and tell me about new deals",
+    "Prix": "Price",
+    "Promo": "Discount",
+    "Aucun compte Steam trouvé sur ce PC.": "No Steam account found on this PC.",
+    "Lecture de ta liste de souhaits et des prix…": "Reading your wishlist and prices…",
+    "Promo sur ta liste de souhaits : {nom} à −{p} ({prix}).": "Wishlist deal: {nom} is {p} off ({prix}).",
+    "{n} promos sur ta liste de souhaits : {noms}": "{n} wishlist deals: {noms}",
+    "Steam ne répond pas. Vérifie ta connexion, puis clique sur Actualiser.":
+        "Steam isn't answering. Check your connection, then click Refresh.",
+    "Ta liste de souhaits est vide, ou elle n'est pas publique.": "Your wishlist is empty, or it isn't public.",
+    "Pour que l'appli la voie : dans Steam, ton profil → Modifier le profil → Confidentialité → "
+    "« Détails du jeu » : Public.":
+        "For the app to see it: in Steam, your profile → Edit Profile → Privacy Settings → \"Game details\": Public.",
+    "{n} jeu dans ta liste de souhaits": "{n} game on your wishlist",
+    "{n} jeux dans ta liste de souhaits": "{n} games on your wishlist",
+    "{n} en promo": "{n} on sale",
+    "L'appli demande ta liste à Steam avec ton identifiant Steam public, puis les prix à la boutique. "
+    "Double-clic sur un jeu : page du magasin.":
+        "The app asks Steam for your wishlist with your public Steam ID, then asks the store for prices. "
+        "Double-click a game for its store page.",
+    # captures d'écran
+    "Captures d'écran": "Screenshots",
+    "Captures d'écran ({n})…": "Screenshots ({n})…",
+    "Ouvrir le dossier": "Open folder",
+    "Aucune capture d'écran Steam sur ce PC.\nDans un jeu, appuie sur F12 pour en prendre une.":
+        "No Steam screenshots on this PC.\nIn a game, press F12 to take one.",
+    "{n} capture": "{n} screenshot",
+    "{n} captures": "{n} screenshots",
+    "les {n} plus récentes affichées": "showing the {n} most recent",
+    # à quoi je joue ?
+    "À quoi je joue ?": "What should I play?",
+    "Tirer au sort parmi": "Pick at random from",
+    "Joués moins de 2 h": "Played less than 2 h",
+    "Tous mes jeux": "All my games",
+    "↻  Un autre": "↻  Another one",
+    "Aucun jeu dans cette catégorie.": "No game in this category.",
+    "▶  Lancer": "▶  Play",
+    "Temps de jeu : {t}": "Playtime: {t}",
+    "Jamais lancé": "Never played",
+    "Installé": "Installed",
+    "Pas installé": "Not installed",
+    "Dernier lancement : {d}": "Last played: {d}",
+    "{nom} est retiré du farm pour que tu puisses y jouer.": "{nom} was removed from the farm so you can play it.",
+    # collections Steam
+    "Favoris": "Favorites",
+    "Cocher une collection Steam": "Check a Steam collection",
+    "Collection « {nom} » : {n} jeu coché.": "Collection \"{nom}\": {n} game checked.",
+    "Collection « {nom} » : {n} jeux cochés.": "Collection \"{nom}\": {n} games checked.",
     "Farmer seulement entre": "Only farm between",
     "h et": ":00 and",
     "h": ":00",

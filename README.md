@@ -26,6 +26,12 @@ A small Windows app that idles your Steam games: Steam thinks the game is runnin
 - **Achievements:** the gold **Achievements** button in the banner (or a right-click on a game) shows the game's achievements with their icons, unlock dates and how many players have them. You can unlock the ones you select, or lock them again (see "Good to know"). The list also has an **Achievements** column (say 12/76) for every game, read from Steam's local cache, and an **Achievements almost done** filter for games where you have at least 80 % of them but not all.
 - **Install:** for a game you own but haven't installed, the banner button says **Install** (also in the right-click menu). It opens Steam's own install window.
 - **New version notice:** at most once a day, the app asks GitHub whether a newer version is out and shows a link at the top of the window. You can turn it off in Options.
+- **Tools → Library value:** the current Steam store price of every game you own, the total, how much of it sits in games you never launched, and what each game costs you per hour played. These are today's store prices, not what you paid.
+- **Tools → Storage:** the size of each installed game, when you last launched it and the free space left on the drive, with an **Uninstall** button that opens Steam's own uninstall window.
+- **Tools → Wishlist deals:** the games on your Steam wishlist with their current price and discount. It can also check once a day and tell you about new deals.
+- **Tools → Screenshots:** a gallery of the Steam screenshots (F12) you took in each game.
+- **Tools → What should I play?:** picks a random game among the ones you never launched, barely played or have installed, then launches or installs it.
+- **Steam collections:** the collections of your Steam library show up as filters, and the Groups menu can check a whole collection for farming. Dynamic collections, the ones Steam builds itself from filters, are not supported.
 - Can stop after a set number of hours, and can keep the PC from going to sleep.
 - Keeps running in the system tray when you close the window, and remembers the window size, its position and how the list is sorted.
 - Can start with Windows: it opens hidden and starts idling the games you checked once Steam is logged in.
@@ -82,6 +88,8 @@ The Achievements column reads Steam's local cache (`appcache\stats`): each game'
 
 The update check is a single request to `api.github.com` for the latest release number, with a generic user agent (`SteamHoursFarm`). It sends nothing about your Steam account, your games or your PC. GitHub sees your IP address, as any website does.
 
+The Tools menu mostly reads Steam's local files: the manifests of installed games, your local settings, the screenshots folder and the local copy of your collections. Two tools go online, and only when you open them. **Library value** sends the IDs of your games to the Steam store to get their prices. **Wishlist deals** sends your public Steam ID to Steam's API to read your wishlist, then asks the store for prices. Your wishlist must be visible for that: in Steam, your profile → Edit Profile → Privacy Settings → Game details: Public. With the daily check turned on, that request is made once a day. These requests only go to Steam, without any cookie or login.
+
 ## Good to know
 
 - **Steam counts real time.** One hour of idling adds one hour to each idled game. Nothing can speed that up, but you can idle several games at once.
@@ -132,6 +140,12 @@ Dans tous les cas, il faut Steam ouvert et connecté, et au moins un jeu Steam i
 - **Succès :** bouton doré **Succès** dans la bannière, ou clic droit sur un jeu. Tu vois les succès du jeu avec leur icône, leur date de déblocage et la part des joueurs qui les ont. Tu peux débloquer ceux que tu sélectionnes, ou les re-verrouiller. La liste a aussi une colonne **Succès** (par exemple 12/76) pour tous tes jeux, lue dans le cache local de Steam, et un filtre **Succès presque finis** : les jeux où tu as au moins 80 % des succès, sans les avoir tous.
 - **Installer :** pour un jeu que tu possèdes sans l'avoir installé, le bouton de la bannière devient **Installer** (aussi dans le clic droit). Il ouvre la fenêtre d'installation de Steam.
 - **Nouvelle version :** une fois par jour au plus, l'appli demande à GitHub si une version plus récente est sortie et affiche un lien en haut de la fenêtre. Tu peux couper ça dans **Options**.
+- **Outils → Valeur de la bibliothèque :** le prix actuel de chaque jeu dans la boutique Steam, le total, la somme qui dort dans des jeux jamais lancés et ce que chaque jeu te coûte par heure jouée. Ce sont les prix du jour, pas ce que tu as payé.
+- **Outils → Stockage :** la taille de chaque jeu installé, la date de ton dernier lancement et la place libre sur le disque, avec un bouton **Désinstaller** qui ouvre la fenêtre de désinstallation de Steam.
+- **Outils → Promos de ma liste de souhaits :** les jeux de ta liste de souhaits Steam avec leur prix du moment et leur promo. L'appli peut aussi vérifier une fois par jour et te prévenir des nouvelles promos.
+- **Outils → Captures d'écran :** une galerie des captures Steam (F12) prises dans chaque jeu.
+- **Outils → À quoi je joue ? :** tire au sort un jeu parmi ceux que tu n'as jamais lancés, peu joués ou installés, puis le lance ou l'installe.
+- **Collections Steam :** les collections de ta bibliothèque deviennent des filtres, et le menu **Groupes** peut cocher toute une collection. Les collections dynamiques, celles que Steam calcule lui-même à partir de filtres, ne sont pas prises en charge.
 - **Options :** arrêt automatique après X heures, PC gardé éveillé, plage horaire, lancement avec Windows, langue, avertissement de nouvelle version, ajout d'un jeu par son AppID.
 - L'appli retient la taille et la position de la fenêtre, et le tri de la liste.
 
@@ -146,6 +160,7 @@ Dans tous les cas, il faut Steam ouvert et connecté, et au moins un jeu Steam i
 - Un succès débloqué avec l'appli apparaît sur ton profil comme les autres, avec la date du déblocage, et tes amis peuvent le voir dans leur fil d'activité. Des sites de classement repèrent les succès débloqués tous d'un coup, et certains jeux protègent les leurs : Steam refuse alors le changement et l'appli te le dit. Ouvrir la fenêtre Succès te met « En jeu » quelques secondes.
 - La colonne Succès vient du cache de Steam : un compte peut avoir du retard tant que le jeu, ou sa page dans la bibliothèque, n'a pas rechargé tes succès. Ouvrir la fenêtre Succès d'un jeu remet son compte à jour.
 - Pour savoir s'il y a une nouvelle version, l'appli envoie une seule requête à GitHub, sans ton compte Steam, ni tes jeux, ni rien sur ton PC. GitHub voit ton adresse IP, comme n'importe quel site.
+- Le menu **Outils** lit surtout des fichiers locaux de Steam. Deux outils vont sur Internet, et seulement quand tu les ouvres. **Valeur de la bibliothèque** envoie les numéros de tes jeux à la boutique Steam pour avoir les prix. **Promos de ma liste de souhaits** envoie ton identifiant Steam public à Steam pour lire ta liste, qui doit être visible : dans Steam, ton profil → Modifier le profil → Confidentialité → « Détails du jeu » : Public. Si tu coches la vérification quotidienne, cette demande part une fois par jour. Ces requêtes ne vont que chez Steam, sans cookie ni connexion à ton compte.
 - Un jeu farmé par un autre outil (ArchiSteamFarm par exemple) compte comme un vrai jeu et met le farm en pause. Si tu utilises les deux, décoche « Mettre le farm en pause quand je lance un vrai jeu » dans **Options**.
 - Pour mettre à jour l'appli, remplace les fichiers du programme et garde `config.json` : il contient tes réglages, tes jeux cochés, tes objectifs, tes groupes et tes statistiques. La langue choisie est aussi retenue dans le registre (`HKEY_CURRENT_USER\Software\FarmHeuresSteam`) : une nouvelle version dézippée ailleurs ne la redemande pas.
 - L'appli enregistre `config.json` sans risquer de le laisser à moitié écrit, et garde une copie de la dernière version lisible dans `config.json.bak`. Si `config.json` est quand même abîmé, elle repart de cette copie et met le fichier abîmé de côté au lieu de l'écraser.
